@@ -1,101 +1,77 @@
-name: JSON Script Executor [Test Mode]
+name: Execute JSON Script
 on:
-  schedule: 
-    - cron: '*/15 * * * *'  # 每5分钟运行一次（UTC时间）
+  schedule:
+    - cron: '7 0,9,10,11,22,23 * * *'  # UTC时间（对应北京时间8:07,17:07等）
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# 添加必要的权限
+permissions:
+  contents: write  # 允许提交文件
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+    
     steps:
-      # 1. 调试信息 - 验证定时任务是否触发
-      - name: Debug schedule trigger
-        run: |
-          echo "🕒 当前系统时间: $(date)"
-          echo "⏰ 工作流触发方式: ${{ github.event_name }}"
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "✅ 计划任务已触发"
-            echo "Cron表达式: ${{ github.event.schedule }}"
-          else
-            echo "🖱️ 手动触发工作流"
-          fi
+      - name: 设置时区（调试用）
+        run: sudo timedatectl set-timezone UTC
       
-      # 2. 代码检出
+      - name: 输出当前时间（调试）
+        run: date
+        
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}  # 使用正确的token
 
-      # 3. Node环境设置
-      - name: Generate lockfile if missing
-        run: |
-          if [ ! -f package-lock.json ]; then
-            npm install
-            echo "Generated package-lock.json"
-          else
-            echo "Lockfile exists"
-          fi
-      - name: Setup Node.js
+      - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      # 4. 安装依赖
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      # 5. 执行脚本 (添加模拟文件创建)
-      - name: Run JSON Script
+      - name: Run JavaScript script
         run: |
-          # 模拟生成文件
-          timestamp=$(date +"%Y%m%d-%H%M%S")
-          echo "extern_user_${timestamp}" > extern_user.txt
-          
-          echo "📄 文件内容:"
-          cat extern_user.txt
-          
-          echo "📁 目录结构:"
-          ls -la
-
-      # 6. 提交变更（添加详细日志）
-      - name: Commit changes
-        run: |
-          # 配置Git
-          git config user.name 'GitHub Actions Bot'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          
-          # 检查变更
-          echo "🔍 Git 状态:"
-          git status
-          
-          # 添加文件
-          git add extern_user.txt
-          
-          # 尝试提交
-          if git diff-index --quiet HEAD --; then
-            echo "🟢 没有检测到变更，跳过提交"
+          echo "当前工作目录: $(pwd)"
+          node run.js 
+          if [ -f "extern_user.txt" ]; then
+            echo "✅ extern_user.txt 文件生成成功"
           else
-            echo "📝 检测到变更，准备提交..."
-            git commit -m "定时更新: extern_user.txt @ ${{ github.run_id }}"
-            git push origin HEAD:${{ github.ref }}
-            echo "✅ 变更已提交到 ${{ github.ref }}"
+            echo "❌ 文件生成失败！"
+            ls -la
+            exit 1
           fi
 
-      # 7. 上传制品
-      - name: Upload artifact
+      # 更新后的提交步骤 - 包含package-lock.json
+      - name: Commit files
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          
+          # 添加需要提交的文件
+          git add extern_user.txt
+          git add package-lock.json  # 新添加的package-lock.json
+          
+          # 检查是否有变化
+          if git diff --staged --quiet; then
+            echo "⚠️ 没有变化需要提交"
+          else
+            git commit -m "Auto-commit: extern_user.txt and package-lock.json $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push origin HEAD:${{ github.ref }}  # 推送到当前分支
+          fi
+          
+          # 调试输出
+          echo "提交后状态:"
+          git status
+          echo "最近一次提交:"
+          git log -1 --oneline
+
+      # 上传为artifact
+      - name: Upload extern_user as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: extern_user_file
+          name: extern_user-${{ github.run_id }}
           path: extern_user.txt
-          retention-days: 3
-
-    
