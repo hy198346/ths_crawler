@@ -44,45 +44,42 @@ jobs:
             exit 1
           fi
 
+      - name: 强力压缩并准备提交
+        run: |
+          # 使用gzip进行强力压缩 (-9 最大压缩比)
+          gzip -9 -c extern_user.txt > extern_user.txt.gz
+          
+          # 验证压缩文件
+          if [ -f "extern_user.txt.gz" ]; then
+            echo "✅ 压缩完成 - 原始大小: $(du -h extern_user.txt | cut -f1)"
+            echo "  压缩后大小: $(du -h extern_user.txt.gz | cut -f1)"
+            
+            # 删除原始文件
+            rm extern_user.txt
+          else
+            echo "❌ 压缩失败！"
+            exit 1
+          fi
+
       - name: Commit files
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
           
-          # 添加需要提交的文件
-          git add extern_user.txt
+          # 添加压缩文件和package-lock.json
+          git add extern_user.txt.gz
           git add package-lock.json
           
           # 检查是否有变化
           if git diff --staged --quiet; then
             echo "⚠️ 没有变化需要提交"
           else
-            git commit -m "Auto-commit: extern_user.txt and package-lock.json $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git commit -m "Auto-commit: 压缩的extr_user.txt.gz和package-lock.json [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
             git push origin HEAD:${{ github.ref }}
           fi
           
           # 调试输出
-          echo "提交后状态:"
-          git status
+          echo "提交文件状态:"
+          git status --porcelain
           echo "最近一次提交:"
           git log -1 --oneline
-
-      # 新增：压缩文件
-      - name: Compress extern_user.txt
-        run: |
-          if [ -f "extern_user.txt" ]; then
-            gzip extern_user.txt
-            echo "✅ 文件压缩成功: extern_user.txt.gz"
-            ls -l extern_user.txt.gz
-          else
-            echo "❌ 压缩失败：extern_user.txt 文件不存在"
-            exit 1
-          fi
-
-      # 修改：上传压缩后的文件
-      - name: Upload extern_user as artifact (gzipped)
-        uses: actions/upload-artifact@v4
-        with:
-          name: extern_user-${{ github.run_id }}.gz
-          path: extern_user.txt.gz
-          retention-days: 1  # 仅保留1天减少存储占用
