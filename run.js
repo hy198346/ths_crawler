@@ -1,7 +1,7 @@
 const { exec } = require('child_process');
 
 // 配置参数
-const MAX_RETRIES = 3;         // 最大重试次数
+const MAX_RETRIES = 5;         // 最大重试次数
 const RETRY_INTERVAL = 1200000;   // 重试间隔(毫秒)
 const EXEC_TIMEOUT = 1800000;   // 执行超时时间(30分钟)
 const SUCCESS_FLAG = 'created'; // 成功标识
