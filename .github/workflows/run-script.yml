@@ -35,6 +35,14 @@ jobs:
           fetch-depth: 0
 
       # 3. Node环境设置
+      - name: Generate lockfile if missing
+        run: |
+          if [ ! -f package-lock.json ]; then
+            npm install
+            echo "Generated package-lock.json"
+          else
+            echo "Lockfile exists"
+          fi
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
