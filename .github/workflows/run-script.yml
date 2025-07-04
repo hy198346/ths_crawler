@@ -7,12 +7,17 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    # 添加必要的权限以便推送提交
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        # 添加深度克隆防止部分文件缺失
         with:
           fetch-depth: 0
+          # 使用token以便后续推送
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -24,24 +29,34 @@ jobs:
 
       - name: Run JavaScript script
         run: |
-          # 显示当前路径（调试用）
           echo "当前工作目录: $(pwd)"
-          # 执行脚本时强制指定工作目录
           node run.js 
-          # 检查文件是否存在
           if [ -f "extern_user.txt" ]; then
             echo "✅ extern_user.txt 文件生成成功"
-            cat extern_user.txt  # 显示文件内容验证
+            cat extern_user.txt
           else
             echo "❌ 文件生成失败！目录内容:"
             ls -la
-            exit 1  # 故意失败以查看日志
+            exit 1
           fi
 
-      # 添加文件上传步骤（可选）
-      - name: Upload extern_user
+      # ▼ 添加这个提交文件的步骤 ▼
+      - name: Commit file
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          git add extern_user.txt
+          # 检查是否有变化
+          if git diff-index --quiet HEAD --; then
+            echo "没有变化需要提交"
+          else
+            git commit -m "Auto-commit extern_user.txt"
+            git push
+          fi
+
+      # 可选的：保留文件上传步骤
+      - name: Upload extern_user as artifact
         uses: actions/upload-artifact@v4
-        if: always()  # 即使失败也上传
         with:
-          name: output-files
+          name: extern_user
           path: extern_user.txt
