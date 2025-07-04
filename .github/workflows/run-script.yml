@@ -1,7 +1,7 @@
 name: Execute JSON Script
 on:
   schedule:
-    - cron: '7 0,9,10,11,22,23 * * *'  # UTC时间对应北京时间+8
+    - cron: '22 0,9,10,11,22,23 * * *'  # UTC时间对应北京时间+8
   workflow_dispatch:
 
 # 解决并发问题（同分支同时只允许一个任务运行）
