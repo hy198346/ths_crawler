@@ -1,42 +1,37 @@
-const { exec } = require('child_process');
+name: Execute JSON Script
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天 UTC 0 点 (北京时间 8:00)
+  workflow_dispatch:     # 保留手动触发
 
-// 配置参数
-const MAX_RETRIES = 10;         // 最大重试次数
-const RETRY_INTERVAL = 30000;   // 重试间隔(毫秒)
-const SUCCESS_FLAG = 'successed'; // 成功标识
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-let retryCount = 0;
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-function runCrawler() {
-  exec('node crawler.js', (error, stdout, stderr) => {
-    // 统一记录日志
-    const logPrefix = `[Attempt ${retryCount + 1}/${MAX_RETRIES}]`;
-    
-    if (error) {
-      console.error(`${logPrefix} 执行错误:`, error.message);
-      if (stderr) console.error(`${logPrefix} 错误输出:`, stderr.trim());
-    }
+      - name: Install dependencies
+        run: npm install  # 安装package.json中的依赖
 
-    // 关键：优先检查成功标志
-    if (stdout.includes(SUCCESS_FLAG)) {
-      console.log(`${logPrefix} 爬取成功！`);
-      console.log('最终输出:', stdout.trim());
-      return; // 成功时直接退出
-    }
+      # 添加运行JS脚本的步骤
+      - name: Run JavaScript script
+        run: node run.js  # 执行根目录下的run.js
 
-    // 未达到最大重试次数时继续
-    if (retryCount < MAX_RETRIES - 1) {
-      retryCount++;
-      console.log(`${logPrefix} 未检测到成功标志，${RETRY_INTERVAL/1000}秒后重试...`);
-      console.log('当前输出:', stdout.trim());
-      if (stderr) console.error('错误输出:', stderr.trim());
-      
-      setTimeout(runCrawler, RETRY_INTERVAL);
-    } else {
-      console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
-      process.exit(1); // 退出进程并返回错误码
-    }
-  });
-}
+      # 可选：处理JSON配置
+      - name: Execute JSON command
+        run: |
+          command=$(jq -r '.tasks[0].command' script.json)
+          eval "$command"
 
-runCrawler();
+      - name: Save output
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-output
+          path: output.txt
+          retention-days: 5
