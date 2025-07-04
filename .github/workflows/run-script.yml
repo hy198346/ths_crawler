@@ -98,12 +98,4 @@ jobs:
           path: extern_user.txt
           retention-days: 3
 
-      # 8. 定时任务健康检查（简化版）
-      - name: Verify schedule
-        if: ${{ github.event_name == 'schedule' }}
-        run: |
-          echo "⏱️ 定时任务健康检查通过"
-          echo "触发方式: 计划任务 (cron)"
-          echo "Cron表达式: ${{ github.event.schedule }}"
-          echo "日志记录: execution_${{ github.run_number }}_${{ github.run_id }}"
-          echo "execution_${{ github.run_number }}_${{ github.run_id }}" >> schedule_log.txt
+    
