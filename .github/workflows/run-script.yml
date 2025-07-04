@@ -1,8 +1,8 @@
 name: Execute JSON Script
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *'  # 每天 UTC 0 点 (北京时间 8:00)
+  workflow_dispatch:     # 保留手动触发
 
 jobs:
   run-script:
@@ -10,17 +10,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          
-      # 删除 npm install 步骤
-      
+
+      - name: Install dependencies
+        run: npm install  # 安装package.json中的依赖
+
+      # 添加运行JS脚本的步骤
       - name: Run JavaScript script
-        run: node run.js
-      
+        run: node run.js  # 执行根目录下的run.js
+
+      # 可选：处理JSON配置
+      - name: Execute JSON command
+        run: |
+          command=$(jq -r '.tasks[0].command' script.json)
+          eval "$command"
+
       - name: Save output
         uses: actions/upload-artifact@v4
         with:
