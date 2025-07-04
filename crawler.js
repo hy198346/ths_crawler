@@ -2,133 +2,96 @@ const http = require("http");
 const https = require('https');
 const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
-const buffer_helper = require("bufferhelper");
 const fs = require("fs");
 const path = require("path");
+const { Buffer } = require('buffer');
 
 const crawler_config = require('./crawler-config');
 const crawler_tools = require('./crawler-tools');
-const stock_info_file_path = crawler_config.config.filePath;
-const sleep_time = crawler_config.config.sleepTime;
-const task_count = crawler_config.config.taksCount;
-const task_sleep_count = crawler_config.config.taskSleepCount;
-const max_count = crawler_config.config.maxCount;
 
-var stock_info_url = "http://basic.10jqka.com.cn/";
-var stock_id_url_params = "fs=m%3A0%2Bt%3A6%2Bf%3A!2%2Cm%3A0%2Bt%3A13%2Bf%3A!2%2Cm%3A0%2Bt%3A80%2Bf%3A!2%2Cm%3A1%2Bt%3A2%2Bf%3A!2%2Cm%3A1%2Bt%3A23%2Bf%3A!2";
-var stock_id_list_url = "http://push2.eastmoney.com/api/qt/clist/get?pz=" + max_count +"&pn=1&" + stock_id_url_params + "&fields=f12%2Cf13";
+// 配置常量
+const STOCK_INFO_FILE_PATH = crawler_config.config.filePath;
+const SLEEP_TIME = crawler_config.config.sleepTime;
+const TASK_COUNT = crawler_config.config.taksCount;
+const TASK_SLEEP_COUNT = crawler_config.config.taskSleepCount;
+const MAX_COUNT = crawler_config.config.maxCount;
 
-var all_stock_id_list_url = "http://99.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=" + max_count + "&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f13";
+// 正则表达式常量
+const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
+const STOCK_REDUCE_REGEX = /增减持计划/;
+const STOCK_INVESTIGATE_REGEX = /立案调查/;
 
-var stock_core_view = "";
-var stock_main_business = "";
-var stock_concept = "";
-var stock_sale_limit = "";
-var stock_reduce_plan = "";
-var stock_investigate = "";
-
-var stock_reduce_cnt = 0;
-var stock_sale_limit_cnt = 0;
-var stock_investigate_cnt = 0;
-
-const stock_sale_limit_regex = "预计解除限售";
-const stock_sale_limit_regex_2 = "限售解禁";
-const stock_reduce_regex = "增减持计划";
-const stock_investigate_regex = "立案调查";
-
-var task_finised_count = 0;
-
-function get_all_stock_info() {
-    if (crawler_config.config.logsFile) {
-        crawler_tools.logFileInit();
-    }
-
-    console.log('start crawling stock..');
-    var start_timestamp = crawler_tools.timestamp();
-    
-    get_stocks( call_back_arr => {
-        
-        if (call_back_arr == null || call_back_arr.length == 0)
-
-            return;
-        console.log('Total stock count : ' + call_back_arr.length);
-        get_all_stock_info_asyn(0, call_back_arr).then(data => {
-            create_stock_info_file();
-            let end_timestamp = crawler_tools.timestamp();
-            let used_time = end_timestamp - start_timestamp;
-            console.log('Total stock info count : ' + call_back_arr.length);
-            console.log('Total time used : ' + (used_time / 1000) + ' s');
-        });
-    });
-}
-
-async function get_all_stock_info_asyn(start_index, stock_id_arr) {
-    if (sleep_time > 0 && (task_finised_count % task_sleep_count) == 0 && task_finised_count > 0) { 
-        await sleep(sleep_time); 
-    }
-    return new Promise(function(resolve, reject) {
-        let count = 0;
-        let total_stock_count = stock_id_arr.length;
-        let tasks = [];
-        for (var i = start_index; i < total_stock_count && count < task_count; i++, count++) {
-            let stock_id = stock_id_arr[i]['f12'];
-            let stock_exchange_id = stock_id_arr[i]['f13'];
-            if (stock_id.startsWith("8") || stock_id.startsWith("4")) {
-                stock_exchange_id = "2";
-            }
-            let promise_task = get_stock_info(stock_id, stock_exchange_id);
-            tasks.push(promise_task);
-        }
-        Promise.all(tasks).then(data => { 
-            if (task_finised_count >= total_stock_count) {
-                resolve();
-            } else {
-                task_finised_count += task_count;
-                let precent = ((task_finised_count / total_stock_count) * 100);
-                if (precent > 100) precent = 100;
-                console.log('finished crawled : ' + precent.toFixed(2) + '%');
-                get_all_stock_info_asyn(task_finised_count, stock_id_arr).then(data => { resolve(); });
-            }
-        }); 
-    });
-}
-
-const sleep = function(ms) {
-    console.log('wait ' + (ms / 1000) + ' second(s) to prevent website block');
-    return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-// Get all ths stocks' id
-// Return the stock id array
-async function get_stocks(call_back) {
-    let all_stock_ids = [];
-    var page = 1;
-    let result = await get_stocks_by_page(page);
-    var total_page = parseInt(result.total / 100);
-    if (result.total % 100 != 0) {
-        total_page++;
-    }
-    all_stock_ids.push(...result.arr);
-
-    while(page < total_page) {
-        page++;
-        let result = await get_stocks_by_page(page);
-        all_stock_ids.push(...result.arr);
-    }
-    call_back(all_stock_ids);
+// 全局状态
+let stockData = {
+    coreView: "",
+    mainBusiness: "",
+    concept: "",
+    saleLimit: "",
+    reducePlan: "",
+    investigate: "",
+    reduceCnt: 0,
+    saleLimitCnt: 0,
+    investigateCnt: 0
 };
 
-function get_stocks_by_page(page) {
-    //console.log(`[Page ${page}] Starting stock data fetch...`);
+let taskFinishedCount = 0;
+
+// 初始化日志
+if (crawler_config.config.logsFile) {
+    crawler_tools.logFileInit();
+}
+
+async function main() {
+    try {
+        console.log('Starting stock crawling process...');
+        const startTimestamp = crawler_tools.timestamp();
+        
+        const stockList = await getAllStocks();
+        if (!stockList || stockList.length === 0) {
+            console.log('No stocks found');
+            return;
+        }
+        
+        console.log(`Total stock count: ${stockList.length}`);
+        await processStocks(stockList);
+        
+        createStockInfoFile();
+        
+        const endTimestamp = crawler_tools.timestamp();
+        const usedTime = (endTimestamp - startTimestamp) / 1000;
+        console.log(`Total time used: ${usedTime.toFixed(2)} seconds`);
+    } catch (error) {
+        console.error('Main process error:', error.message);
+    }
+}
+
+async function getAllStocks() {
+    const allStockIds = [];
+    const initialPage = await getStocksByPage(1);
     
-    return new Promise((resolve, reject) => {
-        // 使用最新推荐的主机名
+    if (!initialPage) return [];
+    
+    const totalPage = Math.ceil(initialPage.total / 100);
+    allStockIds.push(...initialPage.arr);
+    
+    for (let page = 2; page <= totalPage; page++) {
+        const result = await getStocksByPage(page);
+        if (result) {
+            allStockIds.push(...result.arr);
+        }
+    }
+    
+    return allStockIds;
+}
+
+async function getStocksByPage(page, retryCount = 0) {
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 5000; // 5秒
+    
+    try {
         const host = "push2delay.eastmoney.com";
         const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f13`;
         
-        //console.log(`[Page ${page}] Requesting: ${host}${path}`);
-        
-        // 配置请求选项
         const options = {
             hostname: host,
             path: path,
@@ -138,255 +101,247 @@ function get_stocks_by_page(page) {
                 'Referer': 'https://quote.eastmoney.com/',
                 'Connection': 'keep-alive'
             },
-            timeout: 10000 // 10秒超时
+            timeout: 15000
         };
         
-        // 选择协议处理器
-        const protocolHandler = options.port === 443 ? https : http;
-        //console.log(`[Page ${page}] Using ${protocolHandler === https ? 'HTTPS' : 'HTTP'} protocol`);
+        const data = await fetchData(options);
+        if (!data || !data.data || !data.data.diff) {
+            throw new Error('Invalid API response structure');
+        }
         
-        const req = protocolHandler.get(options, (res) => {
-            //console.log(`[Page ${page}] HTTP response received. Status: ${res.statusCode} ${res.statusMessage}`);
+        return {
+            arr: Object.values(data.data.diff),
+            total: data.data.total || 0
+        };
+    } catch (error) {
+        console.error(`Page ${page} error: ${error.message}`);
+        if (retryCount < MAX_RETRIES) {
+            console.log(`Retrying page ${page} (attempt ${retryCount + 1})...`);
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            return getStocksByPage(page, retryCount + 1);
+        }
+        console.error(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
+        return null;
+    }
+}
+
+async function processStocks(stockList) {
+    const totalStocks = stockList.length;
+    const batches = Math.ceil(totalStocks / TASK_COUNT);
+    
+    for (let i = 0; i < batches; i++) {
+        const startIdx = i * TASK_COUNT;
+        const endIdx = Math.min(startIdx + TASK_COUNT, totalStocks);
+        const batch = stockList.slice(startIdx, endIdx);
+        
+        await processBatch(batch);
+        
+        taskFinishedCount += batch.length;
+        const percent = Math.min(100, (taskFinishedCount / totalStocks) * 100);
+        console.log(`Progress: ${percent.toFixed(2)}% completed`);
+        
+        // 休眠控制
+        if (SLEEP_TIME > 0 && (i % TASK_SLEEP_COUNT === 0) && i > 0) {
+            console.log(`Sleeping for ${SLEEP_TIME / 1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, SLEEP_TIME));
+        }
+    }
+}
+
+async function processBatch(batch) {
+    const promises = batch.map(stock => {
+        const stockId = stock.f12;
+        let exchangeId = stock.f13;
+        
+        if (stockId.startsWith("8") || stockId.startsWith("4")) {
+            exchangeId = "2";
+        }
+        
+        return getStockInfo(stockId, exchangeId);
+    });
+    
+    await Promise.all(promises);
+}
+
+async function getStockInfo(stockId, exchangeId) {
+    const MAX_RETRIES = 2;
+    const RETRY_DELAY = 3000; // 3秒
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const url = `http://basic.10jqka.com.cn/${stockId}/`;
+            const html = await fetchHtml(url);
             
-            // 处理重定向
-            if ([301, 302, 307, 308].includes(res.statusCode)) {
-                const redirectUrl = res.headers.location;
-                console.log(`[Page ${page}] Redirecting to: ${redirectUrl}`);
-                return resolve(get_stocks_by_page(page)); // 递归跟随重定向
+            if (!html) {
+                throw new Error('Empty HTML response');
             }
             
-            // 验证状态码
-            if (res.statusCode !== 200) {
-                const err = new Error(`Invalid status code: ${res.statusCode}`);
-                console.error(`[Page ${page}] ${err.message}`);
-                return reject(err);
-            }
+            const $ = cheerio.load(html);
+            const stockPrefix = `${exchangeId}|${stockId}`;
             
-            let rawData = [];
-            let totalBytes = 0;
+            // 提取核心信息
+            stockData.coreView += `${stockPrefix}|9|${crawler_tools.str_trim($('span.core-view-text').text())}|0.000\n`;
+            stockData.mainBusiness += `${stockPrefix}|8|${crawler_tools.str_trim($('span.main-bussiness-text').find('a.newtaid').text())}|0.000\n`;
             
-            res.on('data', (chunk) => {
-                rawData.push(chunk);
-                totalBytes += chunk.length;
-                //console.log(`[Page ${page}] Received chunk ${chunk.length} bytes`);
+            // 提取概念信息
+            const concepts = [];
+            $('div.newconcept a.newtaid').not('a.alltext').each((index, element) => {
+                concepts.push(crawler_tools.str_trim($(element).text()));
             });
+            stockData.concept += `${stockPrefix}|18|${concepts.join(',')}|0.000\n`;
             
+            // 提取特殊事件信息
+            extractSpecialEvents($, stockPrefix);
+            
+            return; // 成功则退出
+        } catch (error) {
+            console.error(`Stock ${stockId} attempt ${attempt} error: ${error.message}`);
+            if (attempt < MAX_RETRIES) {
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            }
+        }
+    }
+    
+    console.error(`Failed to fetch stock ${stockId} after ${MAX_RETRIES} attempts`);
+}
+
+function extractSpecialEvents($, stockPrefix) {
+    $('div.new_msg div.overview table tr').each((index, element) => {
+        if (index >= 20) return false; // 最多读取20行
+        
+        const title = crawler_tools.str_trim($(element).find('td strong.hltip').text());
+        if (!title) return;
+        
+        if (STOCK_SALE_LIMIT_REGEX.test(title)) {
+            processSaleLimit($(element), $, stockPrefix);
+            return false;
+        } else if (STOCK_REDUCE_REGEX.test(title)) {
+            processReducePlan($(element), $, stockPrefix);
+            return false;
+        } else if (STOCK_INVESTIGATE_REGEX.test(title)) {
+            processInvestigate($(element), $, stockPrefix);
+            return false;
+        }
+    });
+}
+
+function processSaleLimit(element, $, stockPrefix) {
+    const date = crawler_tools.str_trim(element.find('td:first-child').text());
+    const text = crawler_tools.str_trim(element.find('td a:first-child').text());
+    
+    const formattedDate = date.length > 10 ? "今天" : date;
+    const detail = `${formattedDate} ${text}`;
+    
+    stockData.saleLimit += `${stockPrefix}|19|${detail}|0.000\n`;
+    stockData.saleLimitCnt++;
+}
+
+function processReducePlan(element, $, stockPrefix) {
+    const text = crawler_tools.str_trim(element.find('td span').text());
+    stockData.reducePlan += `${stockPrefix}|20|${text}|0.000\n`;
+    stockData.reduceCnt++;
+}
+
+function processInvestigate(element, $, stockPrefix) {
+    let text = crawler_tools.str_trim(element.find('td span').text());
+    text = text.replace(/[\r\n]+/g, "").replace(/\s+/g, "");
+    
+    const index = text.indexOf('▼');
+    if (index !== -1) text = text.substring(0, index);
+    
+    const detailIndex = text.indexOf('详细内容');
+    if (detailIndex !== -1) text = text.substring(0, detailIndex);
+    
+    stockData.investigate += `${stockPrefix}|21|${text}|0.000\n`;
+    stockData.investigateCnt++;
+}
+
+function createStockInfoFile() {
+    const content = [
+        stockData.mainBusiness,
+        stockData.coreView,
+        stockData.concept,
+        stockData.saleLimit,
+        stockData.reducePlan,
+        stockData.investigate
+    ].join('');
+    
+    const backupPath = getBackupFilePath();
+    try {
+        if (fs.existsSync(STOCK_INFO_FILE_PATH)) {
+            fs.renameSync(STOCK_INFO_FILE_PATH, backupPath);
+        }
+    } catch (err) {
+        console.error('Backup error:', err.message);
+    }
+    
+    try {
+        const gbkContent = iconv.encode(content, 'GBK');
+        fs.writeFileSync(STOCK_INFO_FILE_PATH, gbkContent);
+        console.log(`File created: ${STOCK_INFO_FILE_PATH}`);
+        
+        console.log(`减持家数: ${stockData.reduceCnt}`);
+        console.log(`解禁家数: ${stockData.saleLimitCnt}`);
+        console.log(`立案家数: ${stockData.investigateCnt}`);
+    } catch (err) {
+        console.error('File write error:', err.message);
+    }
+}
+
+function getBackupFilePath() {
+    const ext = path.extname(STOCK_INFO_FILE_PATH);
+    const base = STOCK_INFO_FILE_PATH.slice(0, -ext.length);
+    return `${base}_${crawler_tools.timestamp()}${ext}`;
+}
+
+async function fetchData(options) {
+    return new Promise((resolve, reject) => {
+        const protocol = options.port === 443 ? https : http;
+        const req = protocol.get(options, (res) => {
+            if (res.statusCode !== 200) {
+                return reject(new Error(`Status code: ${res.statusCode}`));
+            }
+            
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
             res.on('end', () => {
                 try {
-                    //console.log(`[Page ${page}] Transfer complete. Total bytes: ${totalBytes}`);
-                    
-                    // 检查空响应
-                    if (totalBytes === 0) {
-                        throw new Error('Empty API response');
-                    }
-                    
-                    const buffer = Buffer.concat(rawData, totalBytes);
-                    //console.log(`[Page ${page}] Buffer created (${buffer.length} bytes)`);
-                    
-                    const dataJson = JSON.parse(buffer.toString());
-                    //console.log(`[Page ${page}] JSON parsed successfully`);
-                    
-                    // 验证响应结构
-                    if (!dataJson.data?.diff) {
-                        console.warn(`[Page ${page}] Unexpected API structure:`, JSON.stringify(dataJson, null, 2).substring(0, 300));
-                        throw new Error('Invalid API response structure');
-                    }
-                    
-                    const stocks = Object.values(dataJson.data.diff);
-                    const totalCount = dataJson.data.total || 0;
-                    
-                    //console.log(`[Page ${page}] Processed ${stocks.length} stock records`);
-                    resolve({
-                        arr: stocks,
-                        total: totalCount
-                    });
-                    
-                } catch (e) {
-                    console.error(`[Page ${page}] Processing error: ${e.message}`);
-                    console.error(`[Page ${page}] Stack trace: ${e.stack}`);
-                    reject(e);
+                    const data = Buffer.concat(chunks);
+                    resolve(JSON.parse(data.toString()));
+                } catch (error) {
+                    reject(error);
                 }
             });
         });
         
-        // 错误处理
-        req.on('error', (err) => {
-            console.error(`[Page ${page}] Network error: ${err.message}`);
-            reject(err);
-        });
-        
+        req.on('error', reject);
         req.on('timeout', () => {
-            console.error(`[Page ${page}] Request timeout`);
-            req.destroy(); // 中断请求
+            req.destroy();
             reject(new Error('Request timeout'));
         });
-        
-        //console.log(`[Page ${page}] Request initiated`);
     });
 }
 
-// Create the extern_user.txt
-function create_stock_info_file() {
-    // backup old file
-    let backup_file_path = get_backup_file_path();
-    fs.rename(stock_info_file_path, backup_file_path, (err) => {
-        if (err && err.code == 'ENOENT') {
-            // file is not exsits
-        }
-    });
-
-    let file_content = stock_main_business + stock_core_view + stock_concept + stock_sale_limit + stock_reduce_plan + stock_investigate;
-    let file_content_gbk = iconv.encode(file_content, 'GBK');
-    fs.writeFile(stock_info_file_path, file_content_gbk, function(err) {
-        if (err) { 
-            console.log(err.message);
-            return false; 
-        }
-        console.log('create ' + stock_info_file_path + ' successed.');
-    });
-};
-
-// Get the stock basic info
-// Then put the info into the string
-// stock_exchange_id value : 0 - SZ, 1 - SH
-function get_stock_info(stock_id, stock_exchange_id) {
-
-    return new Promise(function(resolve, reject) {
-        let url = stock_info_url + stock_id + "/";
+async function fetchHtml(url) {
+    return new Promise((resolve, reject) => {
         http.get(url, (res) => {
-            let raw_data = new buffer_helper();
+            if (res.statusCode !== 200) {
+                return reject(new Error(`Status code: ${res.statusCode} for ${url}`));
+            }
             
-            res.on('data', (chunk) => { raw_data.concat(chunk); });
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
             res.on('end', () => {
                 try {
-                    let doc_data = iconv.decode(raw_data.toBuffer(), 'GBK');
-                    let doc = cheerio.load(doc_data);
-                    let stock_info_prex = stock_exchange_id + '|' + stock_id;
-                    let core_view = doc('span.core-view-text').text();
-                    let main_business = doc('span.main-bussiness-text').find('a.newtaid').text();
-                    let concepts = '';
-
-
-                    let sale_limit_div = doc('div.new_msg').find('div.overview');
-                    let sale_limit_detail = "";
-                    sale_limit_div.find('table tr').each((index, element) => {
-                        if (index >= 20) return false; // read 20 lines at max
-                        let sale_limit_title = crawler_tools.str_trim(doc(element).find('td strong.hltip').text());
-
-                        
-                        if (sale_limit_title && (sale_limit_title.indexOf(stock_sale_limit_regex) != -1 || sale_limit_title.indexOf(stock_sale_limit_regex_2) != -1 )) {
-                            let sale_limit_date = crawler_tools.str_trim(doc(element).find('td:first-child').text());
-                            let sale_limit_text = crawler_tools.str_trim(doc(element).find('td a:first-child').text());
-                            if(sale_limit_date.length > 10) sale_limit_date = "今天";
-                            let sale_limit_detail = sale_limit_date + " " + sale_limit_text;
-                            stock_sale_limit += stock_info_prex + '|19|' + sale_limit_detail + '|0.000\n';
-                            
-                            stock_sale_limit_cnt += 1;
-                            
-                            return false;
-                        } else if (sale_limit_title && sale_limit_title.indexOf(stock_reduce_regex) != -1) {
-                            let stock_reduce_text = crawler_tools.str_trim(doc(element).find('td span').text());
-                            stock_reduce_plan += stock_info_prex + '|20|' + stock_reduce_text + '|0.000\n';
-                            
-                            //console.log(stock_reduce_plan);
-                            stock_reduce_cnt +=1;
-                            return false;
-                        } else if (sale_limit_title && sale_limit_title.indexOf(stock_investigate_regex) != -1) {
-                            let stock_investigate_text = crawler_tools.str_trim(doc(element).find('td span').text());
-                            stock_investigate_text = stock_investigate_text.replace(/[r\n]/g,"");
-                            stock_investigate_text = stock_investigate_text.replace(/\ +/g,"");
-                            //let index = stock_investigate_text.indexOf(/\u25bc/);
-                            let index = stock_investigate_text.indexOf('▼');
-                            //console.log(index);
-                            stock_investigate_text = stock_investigate_text.substr(0, index);
-                            index = stock_investigate_text.indexOf('详细内容');
-                            stock_investigate_text = stock_investigate_text.substr(0, index);
-                            stock_investigate += stock_info_prex + '|21|' + stock_investigate_text + '|0.000\n';
-                            
-                            //console.log(stock_investigate);
-                            stock_investigate_cnt += 1;
-                            return false;
-                        }
-                    });
-
-                    /*let concept_dash_ele = doc('div.newconcept').find('a[href].alltext');
-                    if (concept_dash_ele != null && crawler_tools.str_trim(concept_dash_ele.text()).length != 0) {
-                        // get concept detail from concept detail page
-                        get_concept_detail(stock_id).then(data => { 
-                            stock_core_view += stock_info_prex + '|9|' + crawler_tools.str_trim(core_view) + '|0.000\n';
-                            stock_main_business += stock_info_prex + '|8|' + crawler_tools.str_trim(main_business) + '|0.000\n';
-                            stock_concept += stock_info_prex + '|18|' + data + '|0.000\n';
-                            //console.log('test: ' + stock_concept);
-                            resolve();
-                        });
-                    } else {*/
-                        doc('div.newconcept').find('a.newtaid').not('a.alltext').each((index, element) => {
-                            if (index > 0) concepts += ',';
-                            let concept_text = doc(element).text();
-                            concepts += crawler_tools.str_trim(concept_text);
-                        });
-
-                        stock_core_view += stock_info_prex + '|9|' + crawler_tools.str_trim(core_view) + '|0.000\n';
-                        stock_main_business += stock_info_prex + '|8|' + crawler_tools.str_trim(main_business) + '|0.000\n';
-                        stock_concept += stock_info_prex + '|18|' + concepts + '|0.000\n';
-                        //console.log('test: ' + stock_concept);
-                        resolve();
-                    //}
-                    
-                } catch (e) {
-                    console.error('Parse the html error : ' + e.message);
+                    const buffer = Buffer.concat(chunks);
+                    resolve(iconv.decode(buffer, 'GBK'));
+                } catch (error) {
+                    reject(error);
                 }
             });
-        }).on('error', (err) => {
-            console.log(err.message);
-        });
-    });
-};
-
-function get_concept_detail(stock_id) {
-    return new Promise(function(resolve, reject) {
-        let url = stock_info_url + stock_id + "/concept.html#ifind";
-        let concepts = '';
-        http.get(url, (res) => {
-            let raw_data = new buffer_helper();
-            res.on('data', (chunk) => { raw_data.concat(chunk); });
-            res.on('end', () => {
-                try {
-                    let doc_data = iconv.decode(raw_data.toBuffer(), 'GBK');
-                    let doc = cheerio.load(doc_data);
-                    doc('table.gnContent tbody tr').not('tr.extend_content').each((index, element) => {
-                        let concept_text = doc(element).find('td.gnName').text();
-                        concept_text = crawler_tools.str_trim(concept_text);
-                        if (concept_text && concept_text.length > 0) {
-                            if (index > 0) concepts += ',';
-                            concepts += concept_text;
-                        }
-                    });
-                    resolve(concepts);
-                } catch (e) {
-                    console.error('Parse the html error : ' + e.message);
-                }
-            });
-        }).on('error', (err) => {
-            console.log(err.message);
-        });
+        }).on('error', reject);
     });
 }
 
-function get_backup_file_path() {
-    let extname = path.extname(stock_info_file_path);
-    let prex_path = stock_info_file_path.substring(0, stock_info_file_path.indexOf(extname));
-    let backup_file_path = prex_path + '_' + crawler_tools.timestamp() + extname;
-    
-    console.log('减持家数：' + stock_reduce_cnt);
-    console.log('解禁家数：' + stock_sale_limit_cnt);
-    console.log('立案家数：' + stock_investigate_cnt);
-    
-    return backup_file_path;
-}
-
-get_all_stock_info();
-
-//get_stock_info("000977", 0);
-//get_stock_info("300414", 0);
-//get_stock_info("601718", 1);
+// 启动主程序
+main().catch(console.error);
