@@ -2,26 +2,36 @@ name: Execute JSON Script
 on:
   schedule:
     - cron: '0 0 * * *'  # 每天 UTC 0 点 (北京时间 8:00)
-  workflow_dispatch:  # 保留手动触发
+  workflow_dispatch:     # 保留手动触发
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4  # 推荐也更新 checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install dependencies
-        run: sudo apt-get install -y jq
+        run: npm install  # 安装package.json中的依赖
 
+      # 添加运行JS脚本的步骤
+      - name: Run JavaScript script
+        run: node run.js  # 执行根目录下的run.js
+
+      # 可选：处理JSON配置
       - name: Execute JSON command
         run: |
           command=$(jq -r '.tasks[0].command' script.json)
           eval "$command"
 
       - name: Save output
-        uses: actions/upload-artifact@v4  # 必须更新到 v4
+        uses: actions/upload-artifact@v4
         with:
           name: script-output
           path: output.txt
-          retention-days: 5  # 新增：自动清理旧文件（可选）
+          retention-days: 5
