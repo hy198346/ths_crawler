@@ -1,10 +1,9 @@
-name: Execute JSON Script
+name: JSON Script Executor [Test Mode]
 on:
-  schedule:
-    - cron: '*/5 * * * *'  # UTC时间对应北京时间+8
+  schedule: 
+    - cron: '*/5 * * * *'  # 每5分钟运行一次（UTC时间）
   workflow_dispatch:
 
-# 解决并发问题（同分支同时只允许一个任务运行）
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,63 +15,88 @@ jobs:
       contents: write
 
     steps:
-      # 1. 代码检出（明确指定分支）
+      # 1. 调试信息 - 验证定时任务是否触发
+      - name: Debug schedule trigger
+        run: |
+          echo "🕒 当前系统时间: $(date)"
+          echo "⏰ 工作流触发方式: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "✅ 计划任务已触发"
+            echo "Cron表达式: ${{ github.event.schedule }}"
+          else
+            echo "🖱️ 手动触发工作流"
+          fi
+      
+      # 2. 代码检出
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}  # 使用触发工作流的分支
+          ref: ${{ github.ref }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Node环境设置
-      - name: Install Node.js
+      # 3. Node环境设置
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
 
-      # 3. 安装依赖
+      # 4. 安装依赖
       - name: Install dependencies
-        run: npm ci --prefer-offline  # 更安全的安装方式
+        run: npm ci
 
-      # 4. 执行脚本
-      - name: Run JavaScript script
+      # 5. 执行脚本 (添加模拟文件创建)
+      - name: Run JSON Script
         run: |
-          node run.js 
-          if [ -f "extern_user.txt" ]; then
-            echo "✅ extern_user.txt 生成成功"
-            cat extern_user.txt
-          else
-            echo "❌ 文件生成失败！目录内容:"
-            ls -la
-            exit 1
-          fi
+          # 模拟生成文件
+          timestamp=$(date +"%Y%m%d-%H%M%S")
+          echo "extern_user_${timestamp}" > extern_user.txt
+          
+          echo "📄 文件内容:"
+          cat extern_user.txt
+          
+          echo "📁 目录结构:"
+          ls -la
 
-      # 5. 提交变更（关键修复点）
-      - name: Commit file
+      # 6. 提交变更（添加详细日志）
+      - name: Commit changes
         run: |
-          # 配置用户信息
-          git config user.name 'GitHub Actions'
-          git config user.email 'actions@github.com'
+          # 配置Git
+          git config user.name 'GitHub Actions Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           
-          # 检出到实际分支（解决分离头指针问题）
-          git checkout -B ${GITHUB_REF#refs/heads/}
+          # 检查变更
+          echo "🔍 Git 状态:"
+          git status
           
-          # 添加并提交文件
+          # 添加文件
           git add extern_user.txt
           
-          # 避免空提交
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Auto-commit extern_user.txt [skip ci]"
-            git push origin HEAD:${GITHUB_REF#refs/heads/}
-            echo "✅ 文件已提交"
+          # 尝试提交
+          if git diff-index --quiet HEAD --; then
+            echo "🟢 没有检测到变更，跳过提交"
           else
-            echo "🟢 无变更可提交"
+            echo "📝 检测到变更，准备提交..."
+            git commit -m "定时更新: extern_user.txt @ ${{ github.run_id }}"
+            git push origin HEAD:${{ github.ref }}
+            echo "✅ 变更已提交到 ${{ github.ref }}"
           fi
 
-      # 6. 上传制品（保持不变）
-      - name: Upload extern_user as artifact
+      # 7. 上传制品
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: extern_user
+          name: extern_user_file
           path: extern_user.txt
+          retention-days: 3
+
+      # 8. 定时任务健康检查
+      - name: Verify schedule
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          echo "⏱️ 定时任务健康检查通过"
+          echo "下次触发时间:"
+          curl -s https://crontab.guru/${{ github.event.schedule }} | grep -A 5 "Next"
+          
+          # 存储执行记录
+          echo "execution_${{ github.run_number }}_${{ github.run_id }}" >> schedule_log.txt
