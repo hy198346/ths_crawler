@@ -1,28 +1,27 @@
 name: Execute JSON Script
 on:
   schedule:
-    # 每天 UTC 时间 0 点运行（北京时间 8:00）
-    - cron: '0 0 * * *'
-  workflow_dispatch:  # 允许手动触发
+    - cron: '0 0 * * *'  # 每天 UTC 0 点 (北京时间 8:00)
+  workflow_dispatch:  # 保留手动触发
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 推荐也更新 checkout
 
-      - name: Read JSON and execute
+      - name: Install dependencies
+        run: sudo apt-get install -y jq
+
+      - name: Execute JSON command
         run: |
-          # 安装 jq（JSON 解析工具）
-          sudo apt-get install -y jq
-
-          # 从 script.json 中提取命令并执行
           command=$(jq -r '.tasks[0].command' script.json)
           eval "$command"
 
       - name: Save output
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # 必须更新到 v4
         with:
           name: script-output
-          path: output.txt  # 保存生成的文件
+          path: output.txt
+          retention-days: 5  # 新增：自动清理旧文件（可选）
