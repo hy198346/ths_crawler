@@ -4,9 +4,8 @@ on:
     - cron: '7 9-23/2 * * *'  # UTC时间（对应北京时间8:07,17:07等）
   workflow_dispatch:
 
-# 添加必要的权限
 permissions:
-  contents: write  # 允许提交文件
+  contents: write
 
 jobs:
   run-script:
@@ -23,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}  # 使用正确的token
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -45,7 +44,6 @@ jobs:
             exit 1
           fi
 
-      # 更新后的提交步骤 - 包含package-lock.json
       - name: Commit files
         run: |
           git config --global user.name 'GitHub Actions'
@@ -53,14 +51,14 @@ jobs:
           
           # 添加需要提交的文件
           git add extern_user.txt
-          git add package-lock.json  # 新添加的package-lock.json
+          git add package-lock.json
           
           # 检查是否有变化
           if git diff --staged --quiet; then
             echo "⚠️ 没有变化需要提交"
           else
             git commit -m "Auto-commit: extern_user.txt and package-lock.json $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push origin HEAD:${{ github.ref }}  # 推送到当前分支
+            git push origin HEAD:${{ github.ref }}
           fi
           
           # 调试输出
@@ -69,9 +67,22 @@ jobs:
           echo "最近一次提交:"
           git log -1 --oneline
 
-      # 上传为artifact
-      - name: Upload extern_user as artifact
+      # 新增：压缩文件
+      - name: Compress extern_user.txt
+        run: |
+          if [ -f "extern_user.txt" ]; then
+            gzip extern_user.txt
+            echo "✅ 文件压缩成功: extern_user.txt.gz"
+            ls -l extern_user.txt.gz
+          else
+            echo "❌ 压缩失败：extern_user.txt 文件不存在"
+            exit 1
+          fi
+
+      # 修改：上传压缩后的文件
+      - name: Upload extern_user as artifact (gzipped)
         uses: actions/upload-artifact@v4
         with:
-          name: extern_user-${{ github.run_id }}
-          path: extern_user.txt
+          name: extern_user-${{ github.run_id }}.gz
+          path: extern_user.txt.gz
+          retention-days: 1  # 仅保留1天减少存储占用
