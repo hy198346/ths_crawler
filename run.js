@@ -1,12 +1,55 @@
 const { exec } = require('child_process');
+const https = require('https');
 
 // 配置参数
 const MAX_RETRIES = 5;         // 最大重试次数
 const RETRY_INTERVAL = 120000;   // 重试间隔(毫秒)
 const EXEC_TIMEOUT = 1800000;   // 执行超时时间(30分钟)
 const SUCCESS_FLAG = 'created'; // 成功标识
+const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
 
 let retryCount = 0;
+
+// 发送消息到Server酱的函数
+function sendServerChan(message) {
+  if (!SERVERCHAN_KEY) {
+    console.warn('未设置SERVERCHAN_KEY，跳过Server酱通知');
+    return;
+  }
+
+  const title = encodeURIComponent('同花顺概念更新成功');
+  const desp = encodeURIComponent(message);
+
+  const options = {
+    hostname: 'sctapi.ftqq.com',
+    path: `/${SERVERCHAN_KEY}.send?title=${title}&desp=${desp}`,
+    method: 'GET'
+  };
+
+  const req = https.request(options, (res) => {
+    let responseBody = '';
+    res.on('data', (chunk) => responseBody += chunk);
+    res.on('end', () => {
+      console.log('Server酱通知状态:', res.statusCode);
+      try {
+        const result = JSON.parse(responseBody);
+        if (result.code === 0) {
+          console.log('✅ Server酱通知发送成功');
+        } else {
+          console.error('❌ Server酱发送失败:', result.message);
+        }
+      } catch (e) {
+        console.error('Server酱响应解析失败:', e.message);
+      }
+    });
+  });
+
+  req.on('error', (error) => {
+    console.error('Server酱请求失败:', error.message);
+  });
+
+  req.end();
+}
 
 function runCrawler() {
   const startTime = new Date();
@@ -44,6 +87,18 @@ function runCrawler() {
       // 成功时退出
       if (successDetected) {
         console.log(`${logPrefix} 爬取成功！`);
+        
+        // 发送Server酱通知
+        const successMessage = [
+          `### ✅ 爬虫任务成功执行`,
+          `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
+          `**开始时间**: ${startTime.toLocaleString()}`,
+          `**结束时间**: ${endTime.toLocaleString()}`,
+          `**执行耗时**: ${elapsed}秒`,
+          `**输出摘要**: ${stdout.trim().slice(-100)}`
+        ].join('\n\n');
+        
+        sendServerChan(successMessage);
         return;
       }
 
@@ -60,8 +115,11 @@ function runCrawler() {
       } 
       // 终止条件
       else {
+        const errorMessage = `## ❌ 爬虫任务失败\n\n已达最大重试次数 (${MAX_RETRIES})`;
+        sendServerChan(errorMessage);
+        
         console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
-        console.error('最后输出:', stdout.trim().slice(-500) || '无输出');  // 截取末尾500字符
+        console.error('最后输出:', stdout.trim().slice(-500) || '无输出');
         process.exit(1);
       }
     }
