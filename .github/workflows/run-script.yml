@@ -1,7 +1,7 @@
 name: Execute JSON Script
 on:
   schedule:
-    - cron: '21 0,9,10,11,22,23 * * *'  # UTC时间对应北京时间+8
+    - cron: '7 0,9,10,11,22,23 * * *'  # UTC时间对应北京时间+8
   workflow_dispatch:
 
 # 解决并发问题（同分支同时只允许一个任务运行）
@@ -46,4 +46,33 @@ jobs:
             echo "❌ 文件生成失败！目录内容:"
             ls -la
             exit 1
-         
+          fi
+
+      # 5. 提交变更（关键修复点）
+      - name: Commit file
+        run: |
+          # 配置用户信息
+          git config user.name 'GitHub Actions'
+          git config user.email 'actions@github.com'
+          
+          # 检出到实际分支（解决分离头指针问题）
+          git checkout -B ${GITHUB_REF#refs/heads/}
+          
+          # 添加并提交文件
+          git add extern_user.txt
+          
+          # 避免空提交
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Auto-commit extern_user.txt [skip ci]"
+            git push origin HEAD:${GITHUB_REF#refs/heads/}
+            echo "✅ 文件已提交"
+          else
+            echo "🟢 无变更可提交"
+          fi
+
+      # 6. 上传制品（保持不变）
+      - name: Upload extern_user as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extern_user
+          path: extern_user.txt
