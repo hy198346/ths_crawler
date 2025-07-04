@@ -1,7 +1,7 @@
 name: JSON Script Executor [Test Mode]
 on:
   schedule: 
-    - cron: '*/5 * * * *'  # 每5分钟运行一次（UTC时间）
+    - cron: '*/120 * * * *'  # 每5分钟运行一次（UTC时间）
   workflow_dispatch:
 
 concurrency:
