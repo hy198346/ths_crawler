@@ -1,8 +1,8 @@
 name: Execute JSON Script
 on:
   schedule:
-    - cron: '7 0,9,10,11,22,23 * * *'  # 每天 UTC 0 点 (北京时间 8:00)
-  workflow_dispatch:     # 保留手动触发
+    - cron: '7 0,9,10,11,22,23 * * *'  # UTC时间对应北京时间+8
+  workflow_dispatch:
 
 jobs:
   run-script:
@@ -10,6 +10,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        # 添加深度克隆防止部分文件缺失
+        with:
+          fetch-depth: 0
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -17,21 +20,28 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install  # 安装package.json中的依赖
+        run: npm install
 
-      # 添加运行JS脚本的步骤
       - name: Run JavaScript script
-        run: node run.js  # 执行根目录下的run.js
-
-      # 可选：处理JSON配置
-      - name: Execute JSON command
         run: |
-          command=$(jq -r '.tasks[0].command' script.json)
-          eval "$command"
+          # 显示当前路径（调试用）
+          echo "当前工作目录: $(pwd)"
+          # 执行脚本时强制指定工作目录
+          node run.js 
+          # 检查文件是否存在
+          if [ -f "extern_user.txt" ]; then
+            echo "✅ extern_user.txt 文件生成成功"
+            cat extern_user.txt  # 显示文件内容验证
+          else
+            echo "❌ 文件生成失败！目录内容:"
+            ls -la
+            exit 1  # 故意失败以查看日志
+          fi
 
-      - name: Save output
+      # 添加文件上传步骤（可选）
+      - name: Upload extern_user
         uses: actions/upload-artifact@v4
+        if: always()  # 即使失败也上传
         with:
-          name: script-output
-          path: output.txt
-          retention-days: 5
+          name: output-files
+          path: extern_user.txt
