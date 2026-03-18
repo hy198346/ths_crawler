@@ -90,7 +90,7 @@ async function getStocksByPage(page, retryCount = 0) {
     
     try {
         const host = "push2delay.eastmoney.com";
-        const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f13`;
+        const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048,m:0+t:83&fields=f12,f13`;
         
         const options = {
             hostname: host,
@@ -153,7 +153,7 @@ async function processBatch(batch) {
         const stockId = stock.f12;
         let exchangeId = stock.f13;
         
-        if (stockId.startsWith("8") || stockId.startsWith("4")) {
+        if (stockId.startsWith("8") || stockId.startsWith("4") || stockId.startsWith("9")) {
             exchangeId = "2";
         }
         
