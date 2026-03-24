@@ -1,5 +1,7 @@
 const { exec } = require('child_process');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 // 配置参数
 const MAX_RETRIES = 5;         // 最大重试次数
@@ -9,6 +11,31 @@ const SUCCESS_FLAG = 'created'; // 成功标识
 const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
 
 let retryCount = 0;
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function getExternUserFileSizeForNotice() {
+  const externUserPath = path.resolve(__dirname, 'extern_user.txt');
+  try {
+    const stat = fs.statSync(externUserPath);
+    if (!stat.isFile()) return '不是文件';
+    return `${formatBytes(stat.size)} (${stat.size} B)`;
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return '文件不存在';
+    return '读取失败';
+  }
+}
 
 // 发送消息到Server酱的函数
 function sendServerChan(message) {
@@ -89,12 +116,14 @@ function runCrawler() {
         console.log(`${logPrefix} 爬取成功！`);
         
         // 发送Server酱通知
+        const externUserSize = getExternUserFileSizeForNotice();
         const successMessage = [
           `### ✅ 爬虫任务成功执行`,
           `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
           `**开始时间**: ${startTime.toLocaleString()}`,
           `**结束时间**: ${endTime.toLocaleString()}`,
           `**执行耗时**: ${elapsed}秒`,
+          `**extern_user.txt 大小**: ${externUserSize}`,
           `**输出摘要**: ${stdout.trim().slice(-100)}`
         ].join('\n\n');
         
@@ -115,7 +144,12 @@ function runCrawler() {
       } 
       // 终止条件
       else {
-        const errorMessage = `## ❌ 爬虫任务失败\n\n已达最大重试次数 (${MAX_RETRIES})`;
+        const externUserSize = getExternUserFileSizeForNotice();
+        const errorMessage = [
+          `## ❌ 爬虫任务失败`,
+          `已达最大重试次数 (${MAX_RETRIES})`,
+          `**extern_user.txt 大小**: ${externUserSize}`
+        ].join('\n\n');
         sendServerChan(errorMessage);
         
         console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
