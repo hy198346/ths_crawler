@@ -5,9 +5,210 @@ const iconv = require("iconv-lite");
 const fs = require("fs");
 const path = require("path");
 const { Buffer } = require('buffer');
+const { URL } = require('url');
 
 const crawler_config = require('./crawler-config');
 const crawler_tools = require('./crawler-tools');
+
+const TUNNEL = "x811.kdltps.com:15818";
+const USERNAME = "t17263192885432";
+const PASSWORD = "dgoqlsul";
+const MAX_TUNNEL_PROXY_FAILURES = 5;
+
+let tunnelProxyFailureCount = 0;
+let tunnelProxyDisabled = false;
+
+function getTunnelProxy() {
+    const [host, portStr] = String(TUNNEL).split(':');
+    const port = Number(portStr);
+    const token = Buffer.from(`${USERNAME}:${PASSWORD}`).toString('base64');
+    return {
+        host,
+        port,
+        authHeader: `Basic ${token}`
+    };
+}
+
+function onTunnelProxySuccess() {
+    tunnelProxyFailureCount = 0;
+}
+
+function onTunnelProxyFailure() {
+    tunnelProxyFailureCount += 1;
+    if (!tunnelProxyDisabled && tunnelProxyFailureCount >= MAX_TUNNEL_PROXY_FAILURES) {
+        tunnelProxyDisabled = true;
+        console.warn(`Tunnel proxy disabled after ${tunnelProxyFailureCount} failures; falling back to direct connection.`);
+    }
+}
+
+function isTunnelProxyEnabled() {
+    return !tunnelProxyDisabled;
+}
+
+function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const isHttps = targetUrl.protocol === 'https:';
+        const client = isHttps ? https : http;
+        const req = client.get(
+            {
+                hostname: targetUrl.hostname,
+                port: targetUrl.port || (isHttps ? 443 : 80),
+                path: `${targetUrl.pathname}${targetUrl.search}`,
+                headers,
+                timeout: timeoutMs
+            },
+            (res) => {
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`Status code: ${res.statusCode}`));
+                }
+
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+            }
+        );
+
+        req.on('error', reject);
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
+}
+
+function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
+    const proxy = getTunnelProxy();
+    const isHttps = targetUrl.protocol === 'https:';
+
+    if (!isHttps) {
+        return new Promise((resolve, reject) => {
+            const req = http.get(
+                {
+                    hostname: proxy.host,
+                    port: proxy.port,
+                    path: targetUrl.href,
+                    headers: {
+                        ...headers,
+                        Host: targetUrl.host,
+                        'Proxy-Authorization': proxy.authHeader
+                    },
+                    timeout: timeoutMs
+                },
+                (res) => {
+                    if (res.statusCode === 407) {
+                        const err = new Error(`Proxy authentication required (status code: ${res.statusCode})`);
+                        err.isTunnelProxyError = true;
+                        return reject(err);
+                    }
+                    if (res.statusCode !== 200) {
+                        return reject(new Error(`Status code: ${res.statusCode}`));
+                    }
+
+                    const chunks = [];
+                    res.on('data', (chunk) => chunks.push(chunk));
+                    res.on('end', () => resolve(Buffer.concat(chunks)));
+                }
+            );
+
+            req.on('error', (e) => {
+                e.isTunnelProxyError = true;
+                reject(e);
+            });
+            req.on('timeout', () => {
+                const err = new Error('Request timeout');
+                err.isTunnelProxyError = true;
+                req.destroy();
+                reject(err);
+            });
+        });
+    }
+
+    return new Promise((resolve, reject) => {
+        const targetPort = targetUrl.port || 443;
+        const connectReq = http.request({
+            hostname: proxy.host,
+            port: proxy.port,
+            method: 'CONNECT',
+            path: `${targetUrl.hostname}:${targetPort}`,
+            headers: {
+                'Proxy-Authorization': proxy.authHeader
+            }
+        });
+
+        connectReq.on('connect', (res, socket) => {
+            if (res.statusCode !== 200) {
+                const err = new Error(`Proxy CONNECT failed (status code: ${res.statusCode})`);
+                err.isTunnelProxyError = true;
+                socket.destroy();
+                return reject(err);
+            }
+
+            const req = https.request(
+                {
+                    hostname: targetUrl.hostname,
+                    port: targetPort,
+                    method: 'GET',
+                    path: `${targetUrl.pathname}${targetUrl.search}`,
+                    headers,
+                    socket,
+                    agent: false,
+                    timeout: timeoutMs
+                },
+                (res2) => {
+                    if (res2.statusCode !== 200) {
+                        return reject(new Error(`Status code: ${res2.statusCode}`));
+                    }
+
+                    const chunks = [];
+                    res2.on('data', (chunk) => chunks.push(chunk));
+                    res2.on('end', () => resolve(Buffer.concat(chunks)));
+                }
+            );
+
+            req.on('error', (e) => {
+                e.isTunnelProxyError = true;
+                reject(e);
+            });
+            req.on('timeout', () => {
+                const err = new Error('Request timeout');
+                err.isTunnelProxyError = true;
+                req.destroy();
+                reject(err);
+            });
+            req.end();
+        });
+
+        connectReq.on('error', (e) => {
+            e.isTunnelProxyError = true;
+            reject(e);
+        });
+        if (timeoutMs) {
+            connectReq.setTimeout(timeoutMs, () => {
+                const err = new Error('Proxy CONNECT timeout');
+                err.isTunnelProxyError = true;
+                connectReq.destroy(err);
+            });
+        }
+        connectReq.end();
+    });
+}
+
+async function getBufferWithTunnelPolicy(targetUrl, headers = {}, timeoutMs) {
+    if (!isTunnelProxyEnabled()) {
+        return getBufferDirect(targetUrl, headers, timeoutMs);
+    }
+
+    try {
+        const data = await getBufferViaTunnelProxy(targetUrl, headers, timeoutMs);
+        onTunnelProxySuccess();
+        return data;
+    } catch (e) {
+        if (e && e.isTunnelProxyError) {
+            onTunnelProxyFailure();
+        }
+        throw e;
+    }
+}
 
 // 配置常量
 const STOCK_INFO_FILE_PATH = crawler_config.config.filePath;
@@ -295,53 +496,27 @@ function getBackupFilePath() {
 }
 
 async function fetchData(options) {
-    return new Promise((resolve, reject) => {
-        const protocol = options.port === 443 ? https : http;
-        const req = protocol.get(options, (res) => {
-            if (res.statusCode !== 200) {
-                return reject(new Error(`Status code: ${res.statusCode}`));
-            }
-            
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
-            res.on('end', () => {
-                try {
-                    const data = Buffer.concat(chunks);
-                    resolve(JSON.parse(data.toString()));
-                } catch (error) {
-                    reject(error);
-                }
-            });
-        });
-        
-        req.on('error', reject);
-        req.on('timeout', () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-    });
+    const protocol = options.port === 443 ? 'https:' : 'http:';
+    const targetUrl = new URL(`${protocol}//${options.hostname}${options.path}`);
+    const buffer = await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout);
+    return JSON.parse(buffer.toString());
 }
 
-async function fetchHtml(url) {
-    return new Promise((resolve, reject) => {
-        http.get(url, (res) => {
-            if (res.statusCode !== 200) {
-                return reject(new Error(`Status code: ${res.statusCode} for ${url}`));
-            }
-            
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
-            res.on('end', () => {
-                try {
-                    const buffer = Buffer.concat(chunks);
-                    resolve(iconv.decode(buffer, 'GBK'));
-                } catch (error) {
-                    reject(error);
-                }
-            });
-        }).on('error', reject);
-    });
+async function fetchHtml(url, timeoutMs = 15000) {
+    const targetUrl = new URL(url);
+    const buffer = await getBufferWithTunnelPolicy(targetUrl, {}, timeoutMs);
+    return iconv.decode(buffer, 'GBK');
 }
 
-// 启动主程序
-main().catch(console.error);
+if (require.main === module) {
+    main().catch(console.error);
+}
+
+module.exports = {
+    fetchData,
+    fetchHtml,
+    _tunnelProxyState: {
+        isEnabled: () => isTunnelProxyEnabled(),
+        getFailureCount: () => tunnelProxyFailureCount
+    }
+};
