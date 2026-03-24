@@ -36,6 +36,7 @@ function onTunnelProxySuccess() {
 
 function onTunnelProxyFailure() {
     tunnelProxyFailureCount += 1;
+    resetTunnelAgents();
     if (!tunnelProxyDisabled && tunnelProxyFailureCount >= MAX_TUNNEL_PROXY_FAILURES) {
         tunnelProxyDisabled = true;
         console.warn(`Tunnel proxy disabled after ${tunnelProxyFailureCount} failures; falling back to direct connection.`);
@@ -105,7 +106,9 @@ function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
                         return reject(err);
                     }
                     if (res.statusCode !== 200) {
-                        return reject(new Error(`Status code: ${res.statusCode}`));
+                        const err = new Error(`Status code: ${res.statusCode}`);
+                        err.isTunnelProxyError = true;
+                        return reject(err);
                     }
 
                     const chunks = [];
@@ -145,7 +148,9 @@ function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
                     return reject(err);
                 }
                 if (res.statusCode !== 200) {
-                    return reject(new Error(`Status code: ${res.statusCode}`));
+                    const err = new Error(`Status code: ${res.statusCode}`);
+                    err.isTunnelProxyError = true;
+                    return reject(err);
                 }
 
                 const chunks = [];
@@ -203,6 +208,22 @@ let tunnelHttpAgent = null;
 let tunnelHttpsAgent = null;
 let proxyHttpKeepAliveAgent = null;
 const STOCK_LIST_CACHE_PATH = path.join(__dirname, 'stock_list_cache.json');
+
+function resetTunnelAgents() {
+    try {
+        if (tunnelHttpAgent && typeof tunnelHttpAgent.destroy === 'function') tunnelHttpAgent.destroy();
+    } catch {}
+    try {
+        if (tunnelHttpsAgent && typeof tunnelHttpsAgent.destroy === 'function') tunnelHttpsAgent.destroy();
+    } catch {}
+    try {
+        if (proxyHttpKeepAliveAgent && typeof proxyHttpKeepAliveAgent.destroy === 'function') proxyHttpKeepAliveAgent.destroy();
+    } catch {}
+
+    tunnelHttpAgent = null;
+    tunnelHttpsAgent = null;
+    proxyHttpKeepAliveAgent = null;
+}
 
 function initTunnelAgents() {
     if (!tunnelHttpAgent || !tunnelHttpsAgent || !proxyHttpKeepAliveAgent) {
@@ -358,7 +379,7 @@ async function getStocksByPage(page, retryCount = 0) {
     
     try {
         const host = "51.push2.eastmoney.com";
-        const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048,m:0+t:83&fields=f12,f13`;
+        const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048,m:0+t:83&fields=f12,f13,f14`;
         
         const options = {
             hostname: host,
@@ -386,9 +407,6 @@ async function getStocksByPage(page, retryCount = 0) {
         console.error(`Page ${page} error: ${error.message}`);
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying page ${page} (attempt ${retryCount + 1})...`);
-            if (page === 1 && retryCount + 1 === 50) {
-                tunnelProxyDisabled = true;
-            }
             if (RETRY_DELAY > 0) {
                 await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
             }
@@ -582,7 +600,14 @@ async function fetchData(options) {
             str = str.substring(firstParen + 1, lastParen);
         }
     }
-    return JSON.parse(str);
+    try {
+        return JSON.parse(str);
+    } catch (e) {
+        if (e && isTunnelProxyEnabled()) {
+            e.isTunnelProxyError = true;
+        }
+        throw e;
+    }
 }
 
 async function fetchHtml(url, timeoutMs = 15000) {
