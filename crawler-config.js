@@ -26,7 +26,11 @@ const crawler_config = {
     fetchTimeout : 12000,
     retryBaseDelay : 200,
     retryMaxDelay : 2500,
-    sessionPoolSize : 20
+    sessionPoolSize : 20,
+    stockMaxRetries : 3,
+    recoveryRounds : 2,
+    recoveryWorkerCap : 40,
+    recoveryMaxRetries : 6
 }
 
 exports.config = crawler_config;

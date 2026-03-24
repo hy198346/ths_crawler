@@ -67,7 +67,11 @@ function markTunnelProxyFailure({ resetGlobalAgents = true } = {}) {
     if (resetGlobalAgents) {
         resetTunnelAgents();
     }
-    if (!tunnelProxyDisabled && tunnelProxyFailureCount >= MAX_TUNNEL_PROXY_FAILURES) {
+    if (
+        process.env.GITHUB_ACTIONS !== 'true' &&
+        !tunnelProxyDisabled &&
+        tunnelProxyFailureCount >= MAX_TUNNEL_PROXY_FAILURES
+    ) {
         tunnelProxyDisabled = true;
         console.warn(`Tunnel proxy disabled after ${tunnelProxyFailureCount} failures; falling back to direct connection.`);
     }
@@ -243,6 +247,10 @@ const STOCK_FETCH_TIMEOUT = Number(crawler_config.config.fetchTimeout || 12000);
 const STOCK_RETRY_BASE_DELAY = Number(crawler_config.config.retryBaseDelay || 200);
 const STOCK_RETRY_MAX_DELAY = Number(crawler_config.config.retryMaxDelay || 2500);
 const STOCK_SESSION_POOL_SIZE = Number(crawler_config.config.sessionPoolSize || 20);
+const STOCK_MAX_RETRIES = Number(crawler_config.config.stockMaxRetries || 3);
+const STOCK_RECOVERY_ROUNDS = Number(crawler_config.config.recoveryRounds || 1);
+const STOCK_RECOVERY_WORKER_CAP = Number(crawler_config.config.recoveryWorkerCap || 60);
+const STOCK_RECOVERY_MAX_RETRIES = Number(crawler_config.config.recoveryMaxRetries || 6);
 const STOCK_STALL_RESET_MS = 60000;
 
 // 正则表达式常量
@@ -442,8 +450,6 @@ let stockData = {
     investigateCnt: 0
 };
 
-let taskFinishedCount = 0;
-
 // 初始化日志
 if (crawler_config.config.logsFile) {
     crawler_tools.logFileInit();
@@ -472,7 +478,34 @@ async function main() {
         } else {
             console.log(`Processing ${stocksToProcess.length} stocks`);
         }
-        await processStocks(stocksToProcess);
+        let result = await processStocks(stocksToProcess, { label: 'main' });
+        let failedStocks = result.failedStocks;
+        if (failedStocks.length > 0 && STOCK_RECOVERY_ROUNDS > 0) {
+            console.warn(`Main pass failed stocks: ${failedStocks.length}`);
+            const recoveryBaseDelay = Math.max(STOCK_RETRY_BASE_DELAY, 800);
+            const recoveryMaxDelay = Math.max(STOCK_RETRY_MAX_DELAY, 8000);
+            const recoveryTimeout = Math.max(STOCK_FETCH_TIMEOUT, 15000);
+            for (let round = 1; round <= STOCK_RECOVERY_ROUNDS && failedStocks.length > 0; round += 1) {
+                console.log(`Recovery round ${round}: ${failedStocks.length}`);
+                result = await processStocks(failedStocks, {
+                    label: `recovery${round}`,
+                    workerCap: STOCK_RECOVERY_WORKER_CAP,
+                    sessionPoolSize: Math.min(STOCK_SESSION_POOL_SIZE, 10),
+                    stockRetryOverrides: {
+                        maxRetries: STOCK_RECOVERY_MAX_RETRIES,
+                        baseDelay: recoveryBaseDelay,
+                        maxDelay: recoveryMaxDelay,
+                        timeoutMs: recoveryTimeout
+                    }
+                });
+                failedStocks = result.failedStocks;
+            }
+            if (failedStocks.length > 0) {
+                console.warn(`Final failed stocks: ${failedStocks.length}`);
+            } else {
+                console.log('Recovery done: all stocks succeeded');
+            }
+        }
         
         createStockInfoFile();
         
@@ -623,28 +656,38 @@ async function getStocksByPage(page, retryCount = 0, session) {
     }
 }
 
-async function processStocks(stockList) {
+async function processStocks(stockList, opts = {}) {
+    const label = opts && opts.label ? String(opts.label) : '';
     const totalStocks = stockList.length;
-    const workerCount = Math.max(1, Math.min(totalStocks, TASK_COUNT, STOCK_WORKER_CAP));
-    const poolSize = Math.max(1, Math.min(workerCount, STOCK_SESSION_POOL_SIZE));
+    const workerCap = opts && Number.isFinite(opts.workerCap) ? Number(opts.workerCap) : STOCK_WORKER_CAP;
+    const sessionPoolSize =
+        opts && Number.isFinite(opts.sessionPoolSize) ? Number(opts.sessionPoolSize) : STOCK_SESSION_POOL_SIZE;
+    const stockRetryOverrides =
+        opts && opts.stockRetryOverrides && typeof opts.stockRetryOverrides === 'object'
+            ? opts.stockRetryOverrides
+            : null;
+    const workerCount = Math.max(1, Math.min(totalStocks, TASK_COUNT, workerCap));
+    const poolSize = Math.max(1, Math.min(workerCount, sessionPoolSize));
     const maxSocketsPerSession = Math.max(1, Math.ceil(workerCount / poolSize));
     const sessions = Array.from({ length: poolSize }, () =>
         createTunnelSession({ maxSockets: maxSocketsPerSession })
     );
+    const failedStocks = [];
     let idx = 0;
+    let finishedCount = 0;
     let nextSleepAt = TASK_SLEEP_COUNT > 0 ? TASK_SLEEP_COUNT : Infinity;
     let sleepPromise = null;
     let successCount = 0;
     let failCount = 0;
     const startedAt = Date.now();
     let lastTickAt = startedAt;
-    let lastFinishedCount = taskFinishedCount;
+    let lastFinishedCount = 0;
     let lastProgressAt = startedAt;
     let stallResetAt = 0;
 
     const maybeSleep = async () => {
         if (SLEEP_TIME <= 0) return;
-        if (taskFinishedCount < nextSleepAt) return;
+        if (finishedCount < nextSleepAt) return;
         if (!sleepPromise) {
             sleepPromise = new Promise((resolve) => setTimeout(resolve, SLEEP_TIME)).finally(() => {
                 sleepPromise = null;
@@ -658,18 +701,19 @@ async function processStocks(stockList) {
         const now = Date.now();
         const elapsedMs = now - startedAt;
         const deltaMs = now - lastTickAt;
-        const finishedDelta = taskFinishedCount - lastFinishedCount;
+        const finishedDelta = finishedCount - lastFinishedCount;
         const rate = deltaMs > 0 ? (finishedDelta * 1000) / deltaMs : 0;
-        const avgRate = elapsedMs > 0 ? (taskFinishedCount * 1000) / elapsedMs : 0;
-        const percent = totalStocks > 0 ? Math.min(100, (taskFinishedCount / totalStocks) * 100) : 0;
+        const avgRate = elapsedMs > 0 ? (finishedCount * 1000) / elapsedMs : 0;
+        const percent = totalStocks > 0 ? Math.min(100, (finishedCount / totalStocks) * 100) : 0;
+        const prefix = label ? `${label} ` : '';
         console.log(
-            `Progress: ${percent.toFixed(2)}% (${taskFinishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s`
+            `${prefix}Progress: ${percent.toFixed(2)}% (${finishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s`
         );
         if (finishedDelta > 0) {
             lastProgressAt = now;
         }
         if (
-            taskFinishedCount < totalStocks &&
+            finishedCount < totalStocks &&
             now - lastProgressAt >= STOCK_STALL_RESET_MS &&
             now - stallResetAt >= STOCK_STALL_RESET_MS
         ) {
@@ -681,7 +725,7 @@ async function processStocks(stockList) {
             resetTunnelAgents();
         }
         lastTickAt = now;
-        lastFinishedCount = taskFinishedCount;
+        lastFinishedCount = finishedCount;
     };
     const ticker = setInterval(tick, 5000);
 
@@ -703,17 +747,19 @@ async function processStocks(stockList) {
                     exchangeId = "2";
                 }
 
-                const ok = await getStockInfo(stockId, exchangeId, session);
+                const ok = await getStockInfo(stockId, exchangeId, session, stockRetryOverrides);
                 if (ok) {
                     successCount += 1;
                 } else {
                     failCount += 1;
+                    failedStocks.push({ f12: stockId, f13: exchangeId });
                 }
 
-                taskFinishedCount += 1;
-                if (taskFinishedCount % 100 === 0 || taskFinishedCount === totalStocks) {
-                    const percent = Math.min(100, (taskFinishedCount / totalStocks) * 100);
-                    console.log(`Progress: ${percent.toFixed(2)}% completed`);
+                finishedCount += 1;
+                if (finishedCount % 100 === 0 || finishedCount === totalStocks) {
+                    const percent = Math.min(100, (finishedCount / totalStocks) * 100);
+                    const prefix = label ? `${label} ` : '';
+                    console.log(`${prefix}Progress: ${percent.toFixed(2)}% completed`);
                 }
             }
         })()
@@ -728,6 +774,8 @@ async function processStocks(stockList) {
             if (session && typeof session.destroy === 'function') session.destroy();
         }
     }
+
+    return { failedStocks, successCount, failCount };
 }
 
 async function processBatch(batch) {
@@ -764,15 +812,22 @@ async function processBatch(batch) {
     }
 }
 
-async function getStockInfo(stockId, exchangeId, session) {
-    const MAX_RETRIES = 3;
+async function getStockInfo(stockId, exchangeId, session, overrides = null) {
+    const MAX_RETRIES =
+        overrides && Number.isFinite(overrides.maxRetries) ? Number(overrides.maxRetries) : STOCK_MAX_RETRIES;
+    const fetchTimeoutMs =
+        overrides && Number.isFinite(overrides.timeoutMs) ? Number(overrides.timeoutMs) : STOCK_FETCH_TIMEOUT;
+    const baseDelayMs =
+        overrides && Number.isFinite(overrides.baseDelay) ? Number(overrides.baseDelay) : STOCK_RETRY_BASE_DELAY;
+    const maxDelayMs =
+        overrides && Number.isFinite(overrides.maxDelay) ? Number(overrides.maxDelay) : STOCK_RETRY_MAX_DELAY;
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             const url = `http://basic.10jqka.com.cn/${stockId}/`;
             const html = await withHardTimeout(
-                fetchHtml(url, STOCK_FETCH_TIMEOUT, session),
-                STOCK_FETCH_TIMEOUT + 3000,
+                fetchHtml(url, fetchTimeoutMs, session),
+                fetchTimeoutMs + 3000,
                 { isTunnelProxyError: true }
             );
             
@@ -815,11 +870,11 @@ async function getStockInfo(stockId, exchangeId, session) {
             }
             if (attempt < MAX_RETRIES) {
                 let delay = Math.min(
-                    STOCK_RETRY_MAX_DELAY,
-                    STOCK_RETRY_BASE_DELAY * Math.pow(2, attempt - 1)
+                    maxDelayMs,
+                    baseDelayMs * Math.pow(2, attempt - 1)
                 );
                 if (isBlocked) {
-                    delay = Math.min(STOCK_RETRY_MAX_DELAY, Math.max(delay, 800 * attempt));
+                    delay = Math.min(maxDelayMs, Math.max(delay, 800 * attempt));
                 }
                 delay += Math.floor(Math.random() * 200);
                 await new Promise((resolve) => setTimeout(resolve, delay));
@@ -905,6 +960,11 @@ function createStockInfoFile() {
         const gbkContent = iconv.encode(content, 'GBK');
         fs.writeFileSync(STOCK_INFO_FILE_PATH, gbkContent);
         console.log(`File created: ${STOCK_INFO_FILE_PATH}`);
+        let lineCount = 0;
+        for (const b of gbkContent) {
+            if (b === 10) lineCount += 1;
+        }
+        console.log(`Line count: ${lineCount}`);
         
         console.log(`减持家数: ${stockData.reduceCnt}`);
         console.log(`解禁家数: ${stockData.saleLimitCnt}`);
