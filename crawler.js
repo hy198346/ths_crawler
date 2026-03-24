@@ -14,7 +14,7 @@ const crawler_tools = require('./crawler-tools');
 const TUNNEL = "x811.kdltps.com:15818";
 const USERNAME = "t17263192885432";
 const PASSWORD = "dgoqlsul";
-const MAX_TUNNEL_PROXY_FAILURES = 5;
+const MAX_TUNNEL_PROXY_FAILURES = 50;
 
 let tunnelProxyFailureCount = 0;
 let tunnelProxyDisabled = false;
@@ -80,19 +80,62 @@ function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
 }
 
 function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
-    initTunnelAgents();
     const isHttps = targetUrl.protocol === 'https:';
-    const client = isHttps ? https : http;
-    const agent = isHttps ? tunnelHttpsAgent : tunnelHttpAgent;
+    if (!isHttps) {
+        const proxy = getTunnelProxy();
+        initTunnelAgents();
+        return new Promise((resolve, reject) => {
+            const req = http.get(
+                {
+                    hostname: proxy.host,
+                    port: proxy.port,
+                    path: targetUrl.href,
+                    headers: {
+                        ...headers,
+                        Host: targetUrl.host,
+                        'Proxy-Authorization': proxy.authHeader
+                    },
+                    agent: proxyHttpKeepAliveAgent,
+                    timeout: timeoutMs
+                },
+                (res) => {
+                    if (res.statusCode === 407) {
+                        const err = new Error(`Proxy authentication required (status code: ${res.statusCode})`);
+                        err.isTunnelProxyError = true;
+                        return reject(err);
+                    }
+                    if (res.statusCode !== 200) {
+                        return reject(new Error(`Status code: ${res.statusCode}`));
+                    }
 
+                    const chunks = [];
+                    res.on('data', (chunk) => chunks.push(chunk));
+                    res.on('end', () => resolve(Buffer.concat(chunks)));
+                }
+            );
+
+            req.on('error', (e) => {
+                e.isTunnelProxyError = true;
+                reject(e);
+            });
+            req.on('timeout', () => {
+                const err = new Error('Request timeout');
+                err.isTunnelProxyError = true;
+                req.destroy();
+                reject(err);
+            });
+        });
+    }
+
+    initTunnelAgents();
     return new Promise((resolve, reject) => {
-        const req = client.get(
+        const req = https.get(
             {
                 hostname: targetUrl.hostname,
-                port: targetUrl.port || (isHttps ? 443 : 80),
+                port: targetUrl.port || 443,
                 path: `${targetUrl.pathname}${targetUrl.search}`,
                 headers,
-                agent,
+                agent: tunnelHttpsAgent,
                 timeout: timeoutMs
             },
             (res) => {
@@ -158,9 +201,11 @@ const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 let tunnelHttpAgent = null;
 let tunnelHttpsAgent = null;
+let proxyHttpKeepAliveAgent = null;
+const STOCK_LIST_CACHE_PATH = path.join(__dirname, 'stock_list_cache.json');
 
 function initTunnelAgents() {
-    if (!tunnelHttpAgent || !tunnelHttpsAgent) {
+    if (!tunnelHttpAgent || !tunnelHttpsAgent || !proxyHttpKeepAliveAgent) {
         const proxy = getTunnelProxy();
         const proxyConfig = {
             host: proxy.host,
@@ -175,7 +220,31 @@ function initTunnelAgents() {
             proxy: proxyConfig,
             maxSockets: 50
         });
+        proxyHttpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
     }
+}
+
+function loadStockListCache() {
+    try {
+        if (!fs.existsSync(STOCK_LIST_CACHE_PATH)) return null;
+        const raw = fs.readFileSync(STOCK_LIST_CACHE_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        const stocks = parsed && Array.isArray(parsed.stocks) ? parsed.stocks : null;
+        if (!stocks || stocks.length === 0) return null;
+        return stocks;
+    } catch {
+        return null;
+    }
+}
+
+function saveStockListCache(stocks) {
+    try {
+        fs.writeFileSync(
+            STOCK_LIST_CACHE_PATH,
+            JSON.stringify({ updatedAt: Date.now(), stocks }),
+            'utf8'
+        );
+    } catch {}
 }
 
 // 全局状态
@@ -210,6 +279,9 @@ async function main() {
         }
         
         console.log(`Total stock count: ${stockList.length}`);
+        if (process.env.ONLY_STOCK_LIST === '1') {
+            return;
+        }
         await processStocks(stockList);
         
         createStockInfoFile();
@@ -223,36 +295,66 @@ async function main() {
 }
 
 async function getAllStocks() {
+    const cachedStocks = loadStockListCache();
     const allStockIds = [];
     const initialPage = await getStocksByPage(1);
     
-    if (!initialPage) return [];
+    if (!initialPage) return cachedStocks || [];
     
     const totalPage = Math.ceil(initialPage.total / 100);
     allStockIds.push(...initialPage.arr);
     
     // 并发获取所有页的数据，限制并发量避免被风控
-    const CONCURRENCY_LIMIT = 5;
+    const CONCURRENCY_LIMIT = 3;
     const pagesToFetch = Array.from({ length: totalPage - 1 }, (_, i) => i + 2);
     
+    const failedPages = [];
     for (let i = 0; i < pagesToFetch.length; i += CONCURRENCY_LIMIT) {
         const batchPages = pagesToFetch.slice(i, i + CONCURRENCY_LIMIT);
         const promises = batchPages.map(page => getStocksByPage(page));
         const results = await Promise.all(promises);
         
-        for (const result of results) {
+        for (let j = 0; j < results.length; j += 1) {
+            const result = results[j];
+            const page = batchPages[j];
+            if (result) {
+                allStockIds.push(...result.arr);
+            } else {
+                failedPages.push(page);
+            }
+        }
+    }
+
+    if (failedPages.length > 0) {
+        const prevTunnelDisabled = tunnelProxyDisabled;
+        tunnelProxyDisabled = true;
+        for (const page of failedPages) {
+            const result = await getStocksByPage(page);
             if (result) {
                 allStockIds.push(...result.arr);
             }
         }
+        if (!prevTunnelDisabled) {
+            tunnelProxyDisabled = false;
+        }
     }
     
+    if (cachedStocks && allStockIds.length < cachedStocks.length) {
+        console.warn(
+            `Fetched stock list size (${allStockIds.length}) smaller than cached (${cachedStocks.length}); using cached list.`
+        );
+        return cachedStocks;
+    }
+
+    if (allStockIds.length >= initialPage.total) {
+        saveStockListCache(allStockIds);
+    }
     return allStockIds;
 }
 
 async function getStocksByPage(page, retryCount = 0) {
-    const MAX_RETRIES = 3;
-    const RETRY_DELAY = 5000; // 5秒
+    const MAX_RETRIES = page === 1 ? 51 : 3;
+    const RETRY_DELAY = page === 1 ? 0 : 5000;
     
     try {
         const host = "51.push2.eastmoney.com";
@@ -284,7 +386,12 @@ async function getStocksByPage(page, retryCount = 0) {
         console.error(`Page ${page} error: ${error.message}`);
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying page ${page} (attempt ${retryCount + 1})...`);
-            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            if (page === 1 && retryCount + 1 === 50) {
+                tunnelProxyDisabled = true;
+            }
+            if (RETRY_DELAY > 0) {
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            }
             return getStocksByPage(page, retryCount + 1);
         }
         console.error(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
