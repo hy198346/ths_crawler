@@ -241,9 +241,14 @@ const TASK_SLEEP_COUNT = crawler_config.config.taskSleepCount;
 const MAX_COUNT = crawler_config.config.maxCount;
 const ONLY_STOCK_LIST = !!crawler_config.config.onlyStockList;
 const MAX_STOCKS = Number(crawler_config.config.maxStocks || 0);
+const IS_CI = process.env.GITHUB_ACTIONS === 'true';
 const STOCK_WORKER_CAP = Number(crawler_config.config.workerCap || 200);
 const STOCK_LIST_CONCURRENCY = Number(crawler_config.config.listConcurrency || 8);
 const STOCK_FETCH_TIMEOUT = Number(crawler_config.config.fetchTimeout || 12000);
+const CI_STOCK_FETCH_TIMEOUT = Number(crawler_config.config.ciFetchTimeout || 20000);
+const STOCK_FETCH_TIMEOUT_EFFECTIVE = IS_CI
+    ? Math.max(STOCK_FETCH_TIMEOUT, CI_STOCK_FETCH_TIMEOUT)
+    : STOCK_FETCH_TIMEOUT;
 const STOCK_RETRY_BASE_DELAY = Number(crawler_config.config.retryBaseDelay || 200);
 const STOCK_RETRY_MAX_DELAY = Number(crawler_config.config.retryMaxDelay || 2500);
 const STOCK_SESSION_POOL_SIZE = Number(crawler_config.config.sessionPoolSize || 20);
@@ -673,8 +678,9 @@ async function processStocks(stockList, opts = {}) {
             ? opts.stockRetryOverrides
             : null;
     const workerCount = Math.max(1, Math.min(totalStocks, TASK_COUNT, workerCap));
-    let currentConcurrency = workerCount;
     const minConcurrency = Math.max(1, Math.min(workerCount, ADAPTIVE_MIN_WORKERS));
+    let currentConcurrency =
+        ADAPTIVE_CONCURRENCY_ENABLED && process.env.GITHUB_ACTIONS === 'true' ? minConcurrency : workerCount;
     const adaptiveWindowSize = Math.max(50, ADAPTIVE_WINDOW_SIZE);
     const poolSize = Math.max(1, Math.min(workerCount, sessionPoolSize));
     const maxSocketsPerSession = Math.max(1, Math.ceil(workerCount / poolSize));
@@ -696,17 +702,17 @@ async function processStocks(stockList, opts = {}) {
     let lastAdjustAt = 0;
     const recent = [];
     let recentFail = 0;
-    let recentHangup = 0;
+    let recentNetErr = 0;
 
-    const pushRecent = ({ ok, hangup }) => {
-        const item = { ok: !!ok, hangup: !!hangup };
+    const pushRecent = ({ ok, netErr }) => {
+        const item = { ok: !!ok, netErr: !!netErr };
         recent.push(item);
         if (!item.ok) recentFail += 1;
-        if (item.hangup) recentHangup += 1;
+        if (item.netErr) recentNetErr += 1;
         while (recent.length > adaptiveWindowSize) {
             const old = recent.shift();
             if (old && !old.ok) recentFail -= 1;
-            if (old && old.hangup) recentHangup -= 1;
+            if (old && old.netErr) recentNetErr -= 1;
         }
     };
 
@@ -733,22 +739,22 @@ async function processStocks(stockList, opts = {}) {
         const prefix = label ? `${label} ` : '';
         const windowN = recent.length;
         const windowFailRate = windowN > 0 ? recentFail / windowN : 0;
-        const windowHangupRate = windowN > 0 ? recentHangup / windowN : 0;
+        const windowNetErrRate = windowN > 0 ? recentNetErr / windowN : 0;
         console.log(
-            `${prefix}Progress: ${percent.toFixed(2)}% (${finishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} conc=${currentConcurrency}/${workerCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s winFail=${(windowFailRate * 100).toFixed(1)}% winHangup=${(windowHangupRate * 100).toFixed(1)}%`
+            `${prefix}Progress: ${percent.toFixed(2)}% (${finishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} conc=${currentConcurrency}/${workerCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s winFail=${(windowFailRate * 100).toFixed(1)}% winNetErr=${(windowNetErrRate * 100).toFixed(1)}%`
         );
         if (finishedDelta > 0) {
             lastProgressAt = now;
         }
         if (ADAPTIVE_CONCURRENCY_ENABLED && windowN >= 50 && now - lastAdjustAt >= ADAPTIVE_ADJUST_COOLDOWN_MS) {
-            if (windowHangupRate >= ADAPTIVE_HANGUP_HIGH || windowFailRate >= 0.25) {
+            if (windowNetErrRate >= ADAPTIVE_HANGUP_HIGH || windowFailRate >= 0.25) {
                 const next = Math.max(minConcurrency, Math.floor(currentConcurrency * 0.8));
                 if (next !== currentConcurrency) {
                     currentConcurrency = next;
                     lastAdjustAt = now;
                     console.warn(`${prefix}Concurrency down: ${currentConcurrency}/${workerCount}`);
                 }
-            } else if (windowHangupRate <= ADAPTIVE_HANGUP_LOW && windowFailRate <= 0.08) {
+            } else if (windowNetErrRate <= ADAPTIVE_HANGUP_LOW && windowFailRate <= 0.08) {
                 const step = Math.max(1, Math.floor(workerCount * 0.05));
                 const next = Math.min(workerCount, currentConcurrency + step);
                 if (next !== currentConcurrency) {
@@ -799,8 +805,8 @@ async function processStocks(stockList, opts = {}) {
 
                 const result = await getStockInfo(stockId, exchangeId, session, stockRetryOverrides);
                 const ok = !!(result && result.ok);
-                const hangup = !!(result && result.hangup);
-                pushRecent({ ok, hangup });
+                const netErr = !!(result && (result.hangup || result.timeout || result.hardTimeout));
+                pushRecent({ ok, netErr });
                 if (ok) {
                     successCount += 1;
                 } else {
@@ -869,7 +875,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
     const MAX_RETRIES =
         overrides && Number.isFinite(overrides.maxRetries) ? Number(overrides.maxRetries) : STOCK_MAX_RETRIES;
     const fetchTimeoutMs =
-        overrides && Number.isFinite(overrides.timeoutMs) ? Number(overrides.timeoutMs) : STOCK_FETCH_TIMEOUT;
+        overrides && Number.isFinite(overrides.timeoutMs) ? Number(overrides.timeoutMs) : STOCK_FETCH_TIMEOUT_EFFECTIVE;
     const baseDelayMs =
         overrides && Number.isFinite(overrides.baseDelay) ? Number(overrides.baseDelay) : STOCK_RETRY_BASE_DELAY;
     const maxDelayMs =
@@ -949,6 +955,9 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             } else if (msg.includes('socket hang up')) {
                 hadHangup = true;
                 lastReason = 'socket_hang_up';
+            } else if (msg.includes('ECONNRESET') || msg.includes('read ECONNRESET')) {
+                hadHangup = true;
+                lastReason = 'conn_reset';
             } else if (msg.includes('Request timeout')) {
                 hadTimeout = true;
                 lastReason = 'timeout';

@@ -24,6 +24,7 @@ const crawler_config = {
     workerCap : 200,
     listConcurrency : 8,
     fetchTimeout : 12000,
+    ciFetchTimeout : 20000,
     retryBaseDelay : 200,
     retryMaxDelay : 2500,
     sessionPoolSize : 20,
