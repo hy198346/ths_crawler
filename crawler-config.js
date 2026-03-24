@@ -18,7 +18,15 @@ const crawler_config = {
     taksCount : 200,
     taskSleepCount : 4000,
     logsFile : false,
-    maxCount : 8000
+    maxCount : 8000,
+    onlyStockList : false,
+    maxStocks : 0,
+    workerCap : 200,
+    listConcurrency : 8,
+    fetchTimeout : 12000,
+    retryBaseDelay : 200,
+    retryMaxDelay : 2500,
+    sessionPoolSize : 20
 }
 
 exports.config = crawler_config;

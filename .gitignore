@@ -1,3 +1,4 @@
 node_modules/
 extern_user*.txt
 stock_list_cache.json
+crawler-secret.json
