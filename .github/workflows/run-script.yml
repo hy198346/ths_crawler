@@ -41,6 +41,9 @@ jobs:
       - name: Run JavaScript script
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }} # 关键步骤
+          TUNNEL_PROXY: ${{ secrets.TUNNEL_PROXY }}
+          TUNNEL_USERNAME: ${{ secrets.TUNNEL_USERNAME }}
+          TUNNEL_PASSWORD: ${{ secrets.TUNNEL_PASSWORD }}
         run: |
           echo "当前工作目录: $(pwd)"
           node run.js 

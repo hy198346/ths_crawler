@@ -21,24 +21,29 @@ let tunnelSecretCache = null;
 
 function loadTunnelSecret() {
     if (tunnelSecretCache) return tunnelSecretCache;
-    try {
-        const raw = fs.readFileSync(tunnelSecretPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        const tunnelStr = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
-        const username = parsed && parsed.username ? String(parsed.username) : '';
-        const password = parsed && parsed.password ? String(parsed.password) : '';
-        if (!tunnelStr || !username || !password) {
-            throw new Error('crawler-secret.json missing fields');
-        }
+
+    const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
+    const username = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
+    const password = process.env.TUNNEL_PASSWORD ? String(process.env.TUNNEL_PASSWORD) : '';
+    if (tunnelStr && username && password) {
         tunnelSecretCache = { tunnel: tunnelStr, username, password };
         return tunnelSecretCache;
-    } catch (e) {
-        const err = new Error(
-            'Missing tunnel proxy secret file. Create crawler-secret.json (see crawler-secret.example.json).'
-        );
-        err.cause = e;
-        throw err;
     }
+
+    if (fs.existsSync(tunnelSecretPath)) {
+        const raw = fs.readFileSync(tunnelSecretPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        const fileTunnel = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
+        const fileUser = parsed && parsed.username ? String(parsed.username) : '';
+        const filePass = parsed && parsed.password ? String(parsed.password) : '';
+        if (!fileTunnel || !fileUser || !filePass) {
+            throw new Error('crawler-secret.json missing fields');
+        }
+        tunnelSecretCache = { tunnel: fileTunnel, username: fileUser, password: filePass };
+        return tunnelSecretCache;
+    }
+
+    throw new Error('Missing tunnel proxy credentials. Set TUNNEL_PROXY/TUNNEL_USERNAME/TUNNEL_PASSWORD.');
 }
 
 function getTunnelProxy() {
