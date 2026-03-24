@@ -29,6 +29,7 @@ const crawler_config = {
     ciDirectFallback : true,
     ciMainMaxRetries : 2,
     ciDirectFallbackMs : 30000,
+    tunnelOnBlockedMs : 60000,
     retryBaseDelay : 200,
     retryMaxDelay : 2500,
     sessionPoolSize : 20,

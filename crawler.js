@@ -16,6 +16,7 @@ const MAX_TUNNEL_PROXY_FAILURES = 200;
 let tunnelProxyFailureCount = 0;
 let tunnelProxyDisabled = false;
 let tunnelProxyDisabledUntil = 0;
+let tunnelProxyPreferredUntil = 0;
 
 const tunnelSecretPath = path.join(__dirname, 'crawler-secret.json');
 let tunnelSecretCache = null;
@@ -90,6 +91,15 @@ function isTunnelProxyEnabled() {
 function temporarilyDisableTunnelProxy(ms) {
     const now = Date.now();
     tunnelProxyDisabledUntil = Math.max(tunnelProxyDisabledUntil, now + ms);
+}
+
+function preferTunnelProxyFor(ms) {
+    const now = Date.now();
+    tunnelProxyPreferredUntil = Math.max(tunnelProxyPreferredUntil, now + ms);
+}
+
+function shouldPreferTunnelProxy() {
+    return tunnelProxyPreferredUntil && Date.now() < tunnelProxyPreferredUntil;
 }
 
 function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
@@ -223,21 +233,22 @@ function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
     });
 }
 
-async function getBufferWithTunnelPolicy(targetUrl, headers = {}, timeoutMs) {
-    if (!isTunnelProxyEnabled()) {
-        return getBufferDirect(targetUrl, headers, timeoutMs);
+async function getBufferWithTunnelPolicy(targetUrl, headers = {}, timeoutMs, session) {
+    if (shouldPreferTunnelProxy() && isTunnelProxyEnabled()) {
+        try {
+            const data = session
+                ? await getBufferViaTunnelProxySession(targetUrl, headers, timeoutMs, session)
+                : await getBufferViaTunnelProxy(targetUrl, headers, timeoutMs);
+            onTunnelProxySuccess();
+            return data;
+        } catch (e) {
+            if (e && e.isTunnelProxyError) {
+                onTunnelProxyFailure();
+            }
+        }
     }
 
-    try {
-        const data = await getBufferViaTunnelProxy(targetUrl, headers, timeoutMs);
-        onTunnelProxySuccess();
-        return data;
-    } catch (e) {
-        if (e && e.isTunnelProxyError) {
-            onTunnelProxyFailure();
-        }
-        throw e;
-    }
+    return getBufferDirect(targetUrl, headers, timeoutMs);
 }
 
 // 配置常量
@@ -259,6 +270,7 @@ const CI_RECOVERY_TIMEOUT = Number(
 const CI_DIRECT_FALLBACK = crawler_config.config.ciDirectFallback !== false;
 const CI_MAIN_MAX_RETRIES = Number(crawler_config.config.ciMainMaxRetries || 2);
 const CI_DIRECT_FALLBACK_MS = Number(crawler_config.config.ciDirectFallbackMs || 30000);
+const TUNNEL_ON_BLOCKED_MS = Number(crawler_config.config.tunnelOnBlockedMs || 60000);
 const STOCK_FETCH_TIMEOUT_EFFECTIVE = IS_CI ? CI_MAIN_TIMEOUT : STOCK_FETCH_TIMEOUT;
 const STOCK_RETRY_BASE_DELAY = Number(crawler_config.config.retryBaseDelay || 200);
 const STOCK_RETRY_MAX_DELAY = Number(crawler_config.config.retryMaxDelay || 2500);
@@ -666,6 +678,11 @@ async function getStocksByPage(page, retryCount = 0, session) {
         };
     } catch (error) {
         console.error(`Page ${page} error: ${error.message}`);
+        const statusCode = error && typeof error.statusCode === 'number' ? error.statusCode : null;
+        const isBlocked = statusCode === 517 || statusCode === 403 || statusCode === 429 || statusCode === 503;
+        if (isBlocked) {
+            preferTunnelProxyFor(TUNNEL_ON_BLOCKED_MS);
+        }
         if (error && error.isTunnelProxyError && session && typeof session.reset === 'function') {
             session.reset();
             markTunnelProxyFailure({ resetGlobalAgents: false });
@@ -933,12 +950,12 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             const html = await withHardTimeout(
                 fetchHtml(url, fetchTimeoutMs, session),
                 fetchTimeoutMs + 3000,
-                { isTunnelProxyError: true }
+                { isTunnelProxyError: shouldPreferTunnelProxy() && isTunnelProxyEnabled() }
             );
             
             if (!html || html.length < 500) {
                 const err = new Error(`Empty or invalid HTML response (length: ${html ? html.length : 0})`);
-                err.isTunnelProxyError = true;
+                err.isTunnelProxyError = shouldPreferTunnelProxy() && isTunnelProxyEnabled();
                 throw err;
             }
             
@@ -952,7 +969,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(html);
                 if (blocked) {
                     const err = new Error('Blocked HTML response');
-                    err.isTunnelProxyError = true;
+                    err.isTunnelProxyError = shouldPreferTunnelProxy() && isTunnelProxyEnabled();
                     throw err;
                 }
             }
@@ -990,6 +1007,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             if (isBlocked) {
                 hadBlocked = true;
                 lastReason = 'blocked';
+                preferTunnelProxyFor(TUNNEL_ON_BLOCKED_MS);
             } else if (statusCode && statusCode >= 500) {
                 lastReason = 'http_5xx';
             } else if (msg.includes('socket hang up')) {
@@ -1007,6 +1025,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             } else if (msg.includes('Blocked HTML response')) {
                 hadBlocked = true;
                 lastReason = 'blocked_html';
+                preferTunnelProxyFor(TUNNEL_ON_BLOCKED_MS);
             } else if (msg.includes('Missing required HTML fields')) {
                 lastReason = 'invalid_html';
             } else {
@@ -1026,51 +1045,6 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 }
                 delay += Math.floor(Math.random() * 200);
                 await new Promise((resolve) => setTimeout(resolve, delay));
-            }
-            if (
-                IS_CI &&
-                CI_DIRECT_FALLBACK &&
-                !isBlocked &&
-                (lastReason === 'socket_hang_up' ||
-                    lastReason === 'conn_reset' ||
-                    lastReason === 'timeout' ||
-                    lastReason === 'hard_timeout')
-            ) {
-                try {
-                    const url = `http://basic.10jqka.com.cn/${stockId}/`;
-                    const directHtml = await withHardTimeout(
-                        fetchHtml(url, fetchTimeoutMs, null),
-                        fetchTimeoutMs + 3000
-                    );
-                    if (directHtml && directHtml.length >= 500) {
-                        const $ = cheerio.load(directHtml);
-                        const stockPrefix = `${exchangeId}|${stockId}`;
-                        const coreViewText = crawler_tools.str_trim($('span.core-view-text').text());
-                        const mainBusinessText = crawler_tools.str_trim(
-                            $('span.main-bussiness-text').find('a.newtaid').text()
-                        );
-                        const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(directHtml);
-                        if (!blocked) {
-                            stockData.coreView += `${stockPrefix}|9|${coreViewText}|0.000\n`;
-                            stockData.mainBusiness += `${stockPrefix}|8|${mainBusinessText}|0.000\n`;
-                            const concepts = [];
-                            $('div.newconcept a.newtaid').not('a.alltext').each((index, element) => {
-                                concepts.push(crawler_tools.str_trim($(element).text()));
-                            });
-                            stockData.concept += `${stockPrefix}|18|${concepts.join(',')}|0.000\n`;
-                            extractSpecialEvents($, stockPrefix);
-                            return {
-                                ok: true,
-                                reason: 'direct_fallback',
-                                statusCode: null,
-                                hangup: hadHangup,
-                                timeout: hadTimeout,
-                                hardTimeout: hadHardTimeout,
-                                blocked: hadBlocked
-                            };
-                        }
-                    }
-                } catch {}
             }
         }
     }
@@ -1204,10 +1178,7 @@ function withHardTimeout(promise, timeoutMs, { isTunnelProxyError = false } = {}
 async function fetchData(options, session) {
     const protocol = options.port === 443 ? 'https:' : 'http:';
     const targetUrl = new URL(`${protocol}//${options.hostname}${options.path}`);
-    const buffer =
-        session && isTunnelProxyEnabled()
-            ? await getBufferViaTunnelProxySession(targetUrl, options.headers, options.timeout, session)
-            : await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout);
+    const buffer = await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout, session);
     let str = buffer.toString();
     // Some endpoints may return JSONP like `callback({...})` if requested poorly, 
     // try to clean it up just in case, though Eastmoney mostly returns JSON with right params
@@ -1221,9 +1192,6 @@ async function fetchData(options, session) {
     try {
         return JSON.parse(str);
     } catch (e) {
-        if (e && isTunnelProxyEnabled()) {
-            e.isTunnelProxyError = true;
-        }
         throw e;
     }
 }
@@ -1236,10 +1204,7 @@ async function fetchHtml(url, timeoutMs = 15000, session) {
         'Accept-Language': 'zh-CN,zh;q=0.9',
         'Connection': 'keep-alive'
     };
-    const buffer =
-        session && isTunnelProxyEnabled()
-            ? await getBufferViaTunnelProxySession(targetUrl, headers, timeoutMs, session)
-            : await getBufferWithTunnelPolicy(targetUrl, headers, timeoutMs);
+    const buffer = await getBufferWithTunnelPolicy(targetUrl, headers, timeoutMs, session);
     return iconv.decode(buffer, 'GBK');
 }
 
