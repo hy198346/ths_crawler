@@ -34,13 +34,19 @@ function onTunnelProxySuccess() {
     tunnelProxyFailureCount = 0;
 }
 
-function onTunnelProxyFailure() {
+function markTunnelProxyFailure({ resetGlobalAgents = true } = {}) {
     tunnelProxyFailureCount += 1;
-    resetTunnelAgents();
+    if (resetGlobalAgents) {
+        resetTunnelAgents();
+    }
     if (!tunnelProxyDisabled && tunnelProxyFailureCount >= MAX_TUNNEL_PROXY_FAILURES) {
         tunnelProxyDisabled = true;
         console.warn(`Tunnel proxy disabled after ${tunnelProxyFailureCount} failures; falling back to direct connection.`);
     }
+}
+
+function onTunnelProxyFailure() {
+    markTunnelProxyFailure();
 }
 
 function isTunnelProxyEnabled() {
@@ -245,6 +251,114 @@ function initTunnelAgents() {
     }
 }
 
+function createTunnelSession() {
+    const proxy = getTunnelProxy();
+    const proxyConfig = {
+        host: proxy.host,
+        port: proxy.port,
+        proxyAuth: `${USERNAME}:${PASSWORD}`
+    };
+    const session = {
+        proxy,
+        proxyHttpAgent: new http.Agent({ keepAlive: true, maxSockets: 1 }),
+        proxyHttpsAgent: tunnel.httpsOverHttp({ proxy: proxyConfig, maxSockets: 1 })
+    };
+    session.reset = () => {
+        try {
+            if (session.proxyHttpAgent && typeof session.proxyHttpAgent.destroy === 'function') session.proxyHttpAgent.destroy();
+        } catch {}
+        try {
+            if (session.proxyHttpsAgent && typeof session.proxyHttpsAgent.destroy === 'function') session.proxyHttpsAgent.destroy();
+        } catch {}
+        session.proxyHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+        session.proxyHttpsAgent = tunnel.httpsOverHttp({ proxy: proxyConfig, maxSockets: 1 });
+    };
+    session.destroy = () => {
+        try {
+            if (session.proxyHttpAgent && typeof session.proxyHttpAgent.destroy === 'function') session.proxyHttpAgent.destroy();
+        } catch {}
+        try {
+            if (session.proxyHttpsAgent && typeof session.proxyHttpsAgent.destroy === 'function') session.proxyHttpsAgent.destroy();
+        } catch {}
+    };
+    return session;
+}
+
+function getBufferViaTunnelProxySession(targetUrl, headers = {}, timeoutMs, session) {
+    const isHttps = targetUrl.protocol === 'https:';
+    if (!isHttps) {
+        return new Promise((resolve, reject) => {
+            const req = http.get(
+                {
+                    hostname: session.proxy.host,
+                    port: session.proxy.port,
+                    path: targetUrl.href,
+                    headers: {
+                        ...headers,
+                        Host: targetUrl.host,
+                        'Proxy-Authorization': session.proxy.authHeader
+                    },
+                    agent: session.proxyHttpAgent,
+                    timeout: timeoutMs
+                },
+                (res) => {
+                    if (res.statusCode !== 200) {
+                        const err = new Error(`Status code: ${res.statusCode}`);
+                        err.isTunnelProxyError = true;
+                        return reject(err);
+                    }
+                    const chunks = [];
+                    res.on('data', (chunk) => chunks.push(chunk));
+                    res.on('end', () => resolve(Buffer.concat(chunks)));
+                }
+            );
+            req.on('error', (e) => {
+                e.isTunnelProxyError = true;
+                reject(e);
+            });
+            req.on('timeout', () => {
+                const err = new Error('Request timeout');
+                err.isTunnelProxyError = true;
+                req.destroy();
+                reject(err);
+            });
+        });
+    }
+
+    return new Promise((resolve, reject) => {
+        const req = https.get(
+            {
+                hostname: targetUrl.hostname,
+                port: targetUrl.port || 443,
+                path: `${targetUrl.pathname}${targetUrl.search}`,
+                headers,
+                agent: session.proxyHttpsAgent,
+                timeout: timeoutMs
+            },
+            (res) => {
+                if (res.statusCode !== 200) {
+                    const err = new Error(`Status code: ${res.statusCode}`);
+                    err.isTunnelProxyError = true;
+                    return reject(err);
+                }
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+            }
+        );
+        req.on('error', (e) => {
+            e.isTunnelProxyError = true;
+            reject(e);
+        });
+        req.on('timeout', () => {
+            const err = new Error('Request timeout');
+            err.isTunnelProxyError = true;
+            req.destroy();
+            reject(err);
+        });
+    });
+}
+
 function loadStockListCache() {
     try {
         if (!fs.existsSync(STOCK_LIST_CACHE_PATH)) return null;
@@ -349,10 +463,14 @@ async function getAllStocks() {
     if (failedPages.length > 0) {
         const prevTunnelDisabled = tunnelProxyDisabled;
         tunnelProxyDisabled = true;
-        for (const page of failedPages) {
-            const result = await getStocksByPage(page);
-            if (result) {
-                allStockIds.push(...result.arr);
+        const RECOVERY_CONCURRENCY_LIMIT = 3;
+        for (let i = 0; i < failedPages.length; i += RECOVERY_CONCURRENCY_LIMIT) {
+            const batchPages = failedPages.slice(i, i + RECOVERY_CONCURRENCY_LIMIT);
+            const results = await Promise.all(batchPages.map(page => getStocksByPage(page)));
+            for (const result of results) {
+                if (result) {
+                    allStockIds.push(...result.arr);
+                }
             }
         }
         if (!prevTunnelDisabled) {
@@ -454,28 +572,47 @@ async function processStocks(stockList) {
 }
 
 async function processBatch(batch) {
-    const promises = batch.map(stock => {
-        const stockId = stock.f12;
-        let exchangeId = stock.f13;
-        
-        if (stockId.startsWith("8") || stockId.startsWith("4") || stockId.startsWith("9")) {
-            exchangeId = "2";
+    const workerCount = Math.max(1, Math.min(batch.length, TASK_COUNT, 20));
+    const sessions = Array.from({ length: workerCount }, () => createTunnelSession());
+    let idx = 0;
+
+    const workers = sessions.map((session) =>
+        (async () => {
+            while (true) {
+                const i = idx;
+                idx += 1;
+                if (i >= batch.length) return;
+
+                const stock = batch[i];
+                const stockId = stock.f12;
+                let exchangeId = stock.f13;
+
+                if (stockId.startsWith("8") || stockId.startsWith("4") || stockId.startsWith("9")) {
+                    exchangeId = "2";
+                }
+
+                await getStockInfo(stockId, exchangeId, session);
+            }
+        })()
+    );
+
+    try {
+        await Promise.all(workers);
+    } finally {
+        for (const session of sessions) {
+            if (session && typeof session.destroy === 'function') session.destroy();
         }
-        
-        return getStockInfo(stockId, exchangeId);
-    });
-    
-    await Promise.all(promises);
+    }
 }
 
-async function getStockInfo(stockId, exchangeId) {
+async function getStockInfo(stockId, exchangeId, session) {
     const MAX_RETRIES = 2;
     const RETRY_DELAY = 3000; // 3秒
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             const url = `http://basic.10jqka.com.cn/${stockId}/`;
-            const html = await fetchHtml(url);
+            const html = await fetchHtml(url, 15000, session);
             
             if (!html) {
                 throw new Error('Empty HTML response');
@@ -501,6 +638,10 @@ async function getStockInfo(stockId, exchangeId) {
             return; // 成功则退出
         } catch (error) {
             console.error(`Stock ${stockId} attempt ${attempt} error: ${error.message}`);
+            if (error && error.isTunnelProxyError && session && typeof session.reset === 'function') {
+                session.reset();
+                markTunnelProxyFailure({ resetGlobalAgents: false });
+            }
             if (attempt < MAX_RETRIES) {
                 await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
             }
@@ -623,9 +764,12 @@ async function fetchData(options) {
     }
 }
 
-async function fetchHtml(url, timeoutMs = 15000) {
+async function fetchHtml(url, timeoutMs = 15000, session) {
     const targetUrl = new URL(url);
-    const buffer = await getBufferWithTunnelPolicy(targetUrl, {}, timeoutMs);
+    const buffer =
+        session && isTunnelProxyEnabled()
+            ? await getBufferViaTunnelProxySession(targetUrl, {}, timeoutMs, session)
+            : await getBufferWithTunnelPolicy(targetUrl, {}, timeoutMs);
     return iconv.decode(buffer, 'GBK');
 }
 
