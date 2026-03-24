@@ -245,10 +245,12 @@ const IS_CI = process.env.GITHUB_ACTIONS === 'true';
 const STOCK_WORKER_CAP = Number(crawler_config.config.workerCap || 200);
 const STOCK_LIST_CONCURRENCY = Number(crawler_config.config.listConcurrency || 8);
 const STOCK_FETCH_TIMEOUT = Number(crawler_config.config.fetchTimeout || 12000);
-const CI_STOCK_FETCH_TIMEOUT = Number(crawler_config.config.ciFetchTimeout || 20000);
-const STOCK_FETCH_TIMEOUT_EFFECTIVE = IS_CI
-    ? Math.max(STOCK_FETCH_TIMEOUT, CI_STOCK_FETCH_TIMEOUT)
-    : STOCK_FETCH_TIMEOUT;
+const CI_MAIN_TIMEOUT = Number(crawler_config.config.ciMainTimeout || STOCK_FETCH_TIMEOUT);
+const CI_RECOVERY_TIMEOUT = Number(
+    crawler_config.config.ciRecoveryTimeout || crawler_config.config.ciFetchTimeout || 20000
+);
+const CI_DIRECT_FALLBACK = crawler_config.config.ciDirectFallback !== false;
+const STOCK_FETCH_TIMEOUT_EFFECTIVE = IS_CI ? CI_MAIN_TIMEOUT : STOCK_FETCH_TIMEOUT;
 const STOCK_RETRY_BASE_DELAY = Number(crawler_config.config.retryBaseDelay || 200);
 const STOCK_RETRY_MAX_DELAY = Number(crawler_config.config.retryMaxDelay || 2500);
 const STOCK_SESSION_POOL_SIZE = Number(crawler_config.config.sessionPoolSize || 20);
@@ -263,6 +265,8 @@ const ADAPTIVE_WINDOW_SIZE = Number(crawler_config.config.adaptiveWindowSize || 
 const ADAPTIVE_HANGUP_HIGH = Number(crawler_config.config.adaptiveHangupHigh || 0.12);
 const ADAPTIVE_HANGUP_LOW = Number(crawler_config.config.adaptiveHangupLow || 0.03);
 const ADAPTIVE_ADJUST_COOLDOWN_MS = Number(crawler_config.config.adaptiveAdjustCooldownMs || 15000);
+const ADAPTIVE_SEVERE_NETERR = 0.6;
+const ADAPTIVE_PAUSE_MS = 5000;
 
 // 正则表达式常量
 const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
@@ -495,7 +499,7 @@ async function main() {
             console.warn(`Main pass failed stocks: ${failedStocks.length}`);
             const recoveryBaseDelay = Math.max(STOCK_RETRY_BASE_DELAY, 800);
             const recoveryMaxDelay = Math.max(STOCK_RETRY_MAX_DELAY, 8000);
-            const recoveryTimeout = Math.max(STOCK_FETCH_TIMEOUT, 15000);
+            const recoveryTimeout = IS_CI ? CI_RECOVERY_TIMEOUT : Math.max(STOCK_FETCH_TIMEOUT, 15000);
             for (let round = 1; round <= STOCK_RECOVERY_ROUNDS && failedStocks.length > 0; round += 1) {
                 console.log(`Recovery round ${round}: ${failedStocks.length}`);
                 result = await processStocks(failedStocks, {
@@ -700,6 +704,8 @@ async function processStocks(stockList, opts = {}) {
     let lastProgressAt = startedAt;
     let stallResetAt = 0;
     let lastAdjustAt = 0;
+    let pauseUntil = 0;
+    let lastSevereAt = 0;
     const recent = [];
     let recentFail = 0;
     let recentNetErr = 0;
@@ -765,6 +771,21 @@ async function processStocks(stockList, opts = {}) {
             }
         }
         if (
+            ADAPTIVE_CONCURRENCY_ENABLED &&
+            windowN >= 100 &&
+            currentConcurrency === minConcurrency &&
+            windowNetErrRate >= ADAPTIVE_SEVERE_NETERR &&
+            now - lastSevereAt >= ADAPTIVE_PAUSE_MS
+        ) {
+            lastSevereAt = now;
+            pauseUntil = Math.max(pauseUntil, now + ADAPTIVE_PAUSE_MS);
+            console.warn(`${prefix}Severe net errors; pausing ${ADAPTIVE_PAUSE_MS}ms and resetting sessions/agents...`);
+            for (const session of sessions) {
+                if (session && typeof session.reset === 'function') session.reset();
+            }
+            resetTunnelAgents();
+        }
+        if (
             finishedCount < totalStocks &&
             now - lastProgressAt >= STOCK_STALL_RESET_MS &&
             now - stallResetAt >= STOCK_STALL_RESET_MS
@@ -787,6 +808,10 @@ async function processStocks(stockList, opts = {}) {
             while (true) {
                 if (ADAPTIVE_CONCURRENCY_ENABLED && workerIdx >= currentConcurrency) {
                     await new Promise((resolve) => setTimeout(resolve, 200));
+                    continue;
+                }
+                if (pauseUntil && Date.now() < pauseUntil) {
+                    await new Promise((resolve) => setTimeout(resolve, 250));
                     continue;
                 }
                 const i = idx;
@@ -986,6 +1011,51 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 }
                 delay += Math.floor(Math.random() * 200);
                 await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+            if (
+                IS_CI &&
+                CI_DIRECT_FALLBACK &&
+                !isBlocked &&
+                (lastReason === 'socket_hang_up' ||
+                    lastReason === 'conn_reset' ||
+                    lastReason === 'timeout' ||
+                    lastReason === 'hard_timeout')
+            ) {
+                try {
+                    const url = `http://basic.10jqka.com.cn/${stockId}/`;
+                    const directHtml = await withHardTimeout(
+                        fetchHtml(url, fetchTimeoutMs, null),
+                        fetchTimeoutMs + 3000
+                    );
+                    if (directHtml && directHtml.length >= 500) {
+                        const $ = cheerio.load(directHtml);
+                        const stockPrefix = `${exchangeId}|${stockId}`;
+                        const coreViewText = crawler_tools.str_trim($('span.core-view-text').text());
+                        const mainBusinessText = crawler_tools.str_trim(
+                            $('span.main-bussiness-text').find('a.newtaid').text()
+                        );
+                        const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(directHtml);
+                        if (!blocked) {
+                            stockData.coreView += `${stockPrefix}|9|${coreViewText}|0.000\n`;
+                            stockData.mainBusiness += `${stockPrefix}|8|${mainBusinessText}|0.000\n`;
+                            const concepts = [];
+                            $('div.newconcept a.newtaid').not('a.alltext').each((index, element) => {
+                                concepts.push(crawler_tools.str_trim($(element).text()));
+                            });
+                            stockData.concept += `${stockPrefix}|18|${concepts.join(',')}|0.000\n`;
+                            extractSpecialEvents($, stockPrefix);
+                            return {
+                                ok: true,
+                                reason: 'direct_fallback',
+                                statusCode: null,
+                                hangup: hadHangup,
+                                timeout: hadTimeout,
+                                hardTimeout: hadHardTimeout,
+                                blocked: hadBlocked
+                            };
+                        }
+                    }
+                } catch {}
             }
         }
     }
