@@ -831,11 +831,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 { isTunnelProxyError: true }
             );
             
-            if (
-                !html ||
-                html.length < 500 ||
-                /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(html)
-            ) {
+            if (!html || html.length < 500) {
                 const err = new Error(`Empty or invalid HTML response (length: ${html ? html.length : 0})`);
                 err.isTunnelProxyError = true;
                 throw err;
@@ -843,10 +839,20 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             
             const $ = cheerio.load(html);
             const stockPrefix = `${exchangeId}|${stockId}`;
+            const coreViewText = crawler_tools.str_trim($('span.core-view-text').text());
+            const mainBusinessText = crawler_tools.str_trim(
+                $('span.main-bussiness-text').find('a.newtaid').text()
+            );
+            if (!coreViewText && !mainBusinessText) {
+                const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(html);
+                const err = new Error(blocked ? 'Blocked HTML response' : 'Missing required HTML fields');
+                err.isTunnelProxyError = true;
+                throw err;
+            }
             
             // 提取核心信息
-            stockData.coreView += `${stockPrefix}|9|${crawler_tools.str_trim($('span.core-view-text').text())}|0.000\n`;
-            stockData.mainBusiness += `${stockPrefix}|8|${crawler_tools.str_trim($('span.main-bussiness-text').find('a.newtaid').text())}|0.000\n`;
+            stockData.coreView += `${stockPrefix}|9|${coreViewText}|0.000\n`;
+            stockData.mainBusiness += `${stockPrefix}|8|${mainBusinessText}|0.000\n`;
             
             // 提取概念信息
             const concepts = [];

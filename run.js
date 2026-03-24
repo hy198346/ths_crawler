@@ -117,12 +117,18 @@ function runCrawler() {
         
         // 发送Server酱通知
         const externUserSize = getExternUserFileSizeForNotice();
+        const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
+        const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
+        const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
+        const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
         const successMessage = [
           `### ✅ 爬虫任务成功执行`,
           `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
           `**开始时间**: ${startTime.toLocaleString()}`,
           `**结束时间**: ${endTime.toLocaleString()}`,
           `**执行耗时**: ${elapsed}秒`,
+          `**股票总数**: ${totalStockCount}`,
+          `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`,
           `**输出摘要**: ${stdout.trim().slice(-100)}`
         ].join('\n\n');
@@ -145,9 +151,15 @@ function runCrawler() {
       // 终止条件
       else {
         const externUserSize = getExternUserFileSizeForNotice();
+        const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
+        const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
+        const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
+        const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
         const errorMessage = [
           `## ❌ 爬虫任务失败`,
           `已达最大重试次数 (${MAX_RETRIES})`,
+          `**股票总数**: ${totalStockCount}`,
+          `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`
         ].join('\n\n');
         sendServerChan(errorMessage);
