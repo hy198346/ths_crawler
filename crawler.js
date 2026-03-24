@@ -1,5 +1,6 @@
 const http = require("http");
 const https = require('https');
+const tunnel = require('tunnel');
 const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
 const fs = require("fs");
@@ -49,12 +50,14 @@ function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
     return new Promise((resolve, reject) => {
         const isHttps = targetUrl.protocol === 'https:';
         const client = isHttps ? https : http;
+        const agent = isHttps ? httpsAgent : httpAgent;
         const req = client.get(
             {
                 hostname: targetUrl.hostname,
                 port: targetUrl.port || (isHttps ? 443 : 80),
                 path: `${targetUrl.pathname}${targetUrl.search}`,
                 headers,
+                agent,
                 timeout: timeoutMs
             },
             (res) => {
@@ -77,119 +80,47 @@ function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
 }
 
 function getBufferViaTunnelProxy(targetUrl, headers = {}, timeoutMs) {
-    const proxy = getTunnelProxy();
+    initTunnelAgents();
     const isHttps = targetUrl.protocol === 'https:';
-
-    if (!isHttps) {
-        return new Promise((resolve, reject) => {
-            const req = http.get(
-                {
-                    hostname: proxy.host,
-                    port: proxy.port,
-                    path: targetUrl.href,
-                    headers: {
-                        ...headers,
-                        Host: targetUrl.host,
-                        'Proxy-Authorization': proxy.authHeader
-                    },
-                    timeout: timeoutMs
-                },
-                (res) => {
-                    if (res.statusCode === 407) {
-                        const err = new Error(`Proxy authentication required (status code: ${res.statusCode})`);
-                        err.isTunnelProxyError = true;
-                        return reject(err);
-                    }
-                    if (res.statusCode !== 200) {
-                        return reject(new Error(`Status code: ${res.statusCode}`));
-                    }
-
-                    const chunks = [];
-                    res.on('data', (chunk) => chunks.push(chunk));
-                    res.on('end', () => resolve(Buffer.concat(chunks)));
-                }
-            );
-
-            req.on('error', (e) => {
-                e.isTunnelProxyError = true;
-                reject(e);
-            });
-            req.on('timeout', () => {
-                const err = new Error('Request timeout');
-                err.isTunnelProxyError = true;
-                req.destroy();
-                reject(err);
-            });
-        });
-    }
+    const client = isHttps ? https : http;
+    const agent = isHttps ? tunnelHttpsAgent : tunnelHttpAgent;
 
     return new Promise((resolve, reject) => {
-        const targetPort = targetUrl.port || 443;
-        const connectReq = http.request({
-            hostname: proxy.host,
-            port: proxy.port,
-            method: 'CONNECT',
-            path: `${targetUrl.hostname}:${targetPort}`,
-            headers: {
-                'Proxy-Authorization': proxy.authHeader
-            }
-        });
-
-        connectReq.on('connect', (res, socket) => {
-            if (res.statusCode !== 200) {
-                const err = new Error(`Proxy CONNECT failed (status code: ${res.statusCode})`);
-                err.isTunnelProxyError = true;
-                socket.destroy();
-                return reject(err);
-            }
-
-            const req = https.request(
-                {
-                    hostname: targetUrl.hostname,
-                    port: targetPort,
-                    method: 'GET',
-                    path: `${targetUrl.pathname}${targetUrl.search}`,
-                    headers,
-                    socket,
-                    agent: false,
-                    timeout: timeoutMs
-                },
-                (res2) => {
-                    if (res2.statusCode !== 200) {
-                        return reject(new Error(`Status code: ${res2.statusCode}`));
-                    }
-
-                    const chunks = [];
-                    res2.on('data', (chunk) => chunks.push(chunk));
-                    res2.on('end', () => resolve(Buffer.concat(chunks)));
+        const req = client.get(
+            {
+                hostname: targetUrl.hostname,
+                port: targetUrl.port || (isHttps ? 443 : 80),
+                path: `${targetUrl.pathname}${targetUrl.search}`,
+                headers,
+                agent,
+                timeout: timeoutMs
+            },
+            (res) => {
+                if (res.statusCode === 407) {
+                    const err = new Error(`Proxy authentication required (status code: ${res.statusCode})`);
+                    err.isTunnelProxyError = true;
+                    return reject(err);
                 }
-            );
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`Status code: ${res.statusCode}`));
+                }
 
-            req.on('error', (e) => {
-                e.isTunnelProxyError = true;
-                reject(e);
-            });
-            req.on('timeout', () => {
-                const err = new Error('Request timeout');
-                err.isTunnelProxyError = true;
-                req.destroy();
-                reject(err);
-            });
-            req.end();
-        });
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+            }
+        );
 
-        connectReq.on('error', (e) => {
+        req.on('error', (e) => {
             e.isTunnelProxyError = true;
             reject(e);
         });
-        if (timeoutMs) {
-            connectReq.setTimeout(timeoutMs, () => {
-                const err = new Error('Proxy CONNECT timeout');
-                err.isTunnelProxyError = true;
-                connectReq.destroy(err);
-            });
-        }
-        connectReq.end();
+        req.on('timeout', () => {
+            const err = new Error('Request timeout');
+            err.isTunnelProxyError = true;
+            req.destroy();
+            reject(err);
+        });
     });
 }
 
@@ -221,6 +152,31 @@ const MAX_COUNT = crawler_config.config.maxCount;
 const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
 const STOCK_REDUCE_REGEX = /增减持计划/;
 const STOCK_INVESTIGATE_REGEX = /立案调查/;
+
+// Agent 缓存，用于连接复用与并发优化
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+let tunnelHttpAgent = null;
+let tunnelHttpsAgent = null;
+
+function initTunnelAgents() {
+    if (!tunnelHttpAgent || !tunnelHttpsAgent) {
+        const proxy = getTunnelProxy();
+        const proxyConfig = {
+            host: proxy.host,
+            port: proxy.port,
+            proxyAuth: `${USERNAME}:${PASSWORD}`
+        };
+        tunnelHttpAgent = tunnel.httpOverHttp({
+            proxy: proxyConfig,
+            maxSockets: 50
+        });
+        tunnelHttpsAgent = tunnel.httpsOverHttp({
+            proxy: proxyConfig,
+            maxSockets: 50
+        });
+    }
+}
 
 // 全局状态
 let stockData = {
@@ -275,10 +231,19 @@ async function getAllStocks() {
     const totalPage = Math.ceil(initialPage.total / 100);
     allStockIds.push(...initialPage.arr);
     
-    for (let page = 2; page <= totalPage; page++) {
-        const result = await getStocksByPage(page);
-        if (result) {
-            allStockIds.push(...result.arr);
+    // 并发获取所有页的数据，限制并发量避免被风控
+    const CONCURRENCY_LIMIT = 5;
+    const pagesToFetch = Array.from({ length: totalPage - 1 }, (_, i) => i + 2);
+    
+    for (let i = 0; i < pagesToFetch.length; i += CONCURRENCY_LIMIT) {
+        const batchPages = pagesToFetch.slice(i, i + CONCURRENCY_LIMIT);
+        const promises = batchPages.map(page => getStocksByPage(page));
+        const results = await Promise.all(promises);
+        
+        for (const result of results) {
+            if (result) {
+                allStockIds.push(...result.arr);
+            }
         }
     }
     
@@ -290,19 +255,20 @@ async function getStocksByPage(page, retryCount = 0) {
     const RETRY_DELAY = 5000; // 5秒
     
     try {
-        const host = "push2delay.eastmoney.com";
+        const host = "51.push2.eastmoney.com";
         const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048,m:0+t:83&fields=f12,f13`;
         
         const options = {
             hostname: host,
             path: path,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'application/json',
-                'Referer': 'https://quote.eastmoney.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
                 'Connection': 'keep-alive'
             },
-            timeout: 15000
+            timeout: 15000,
+            port: 80
         };
         
         const data = await fetchData(options);
@@ -499,7 +465,17 @@ async function fetchData(options) {
     const protocol = options.port === 443 ? 'https:' : 'http:';
     const targetUrl = new URL(`${protocol}//${options.hostname}${options.path}`);
     const buffer = await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout);
-    return JSON.parse(buffer.toString());
+    let str = buffer.toString();
+    // Some endpoints may return JSONP like `callback({...})` if requested poorly, 
+    // try to clean it up just in case, though Eastmoney mostly returns JSON with right params
+    if (str && str.startsWith('jQuery')) {
+        const firstParen = str.indexOf('(');
+        const lastParen = str.lastIndexOf(')');
+        if (firstParen !== -1 && lastParen !== -1) {
+            str = str.substring(firstParen + 1, lastParen);
+        }
+    }
+    return JSON.parse(str);
 }
 
 async function fetchHtml(url, timeoutMs = 15000) {

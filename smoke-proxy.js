@@ -4,17 +4,19 @@ async function run() {
     console.log('Tunnel enabled:', _tunnelProxyState.isEnabled());
     console.log('Tunnel failures:', _tunnelProxyState.getFailureCount());
 
-    const host = "push2delay.eastmoney.com";
+    const host = "51.push2.eastmoney.com";
     const path = `/api/qt/clist/get?pn=1&pz=1&po=1&fid=f3&fs=m:0+t:6&fields=f12,f13`;
     const options = {
         hostname: host,
         path: path,
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://quote.eastmoney.com/'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Connection': 'keep-alive'
         },
-        timeout: 15000
+        timeout: 15000,
+        port: 80
     };
 
     try {
