@@ -15,91 +15,48 @@ const MAX_TUNNEL_PROXY_FAILURES = 200;
 
 let tunnelProxyFailureCount = 0;
 let tunnelProxyDisabled = false;
+let tunnelProxyDisabledUntil = 0;
 
 const tunnelSecretPath = path.join(__dirname, 'crawler-secret.json');
-let tunnelProxyPoolCache = null;
+let tunnelSecretCache = null;
 
-function parseTunnelProxyPool(entries, fallbackUsername, fallbackPassword) {
-    const pool = [];
-    for (const raw of entries) {
-        const item = String(raw || '').trim();
-        if (!item) continue;
-        const parts = item.split('|');
-        const tunnelStr = (parts[0] || '').trim();
-        const username = (parts[1] || '').trim() || fallbackUsername;
-        const password = (parts[2] || '').trim() || fallbackPassword;
-        if (!tunnelStr || !username || !password) continue;
-        const [host, portStr] = tunnelStr.split(':');
-        const port = Number(portStr);
-        if (!host || !Number.isFinite(port) || port <= 0) continue;
-        const token = Buffer.from(`${username}:${password}`).toString('base64');
-        pool.push({
-            tunnel: tunnelStr,
-            host,
-            port,
-            authHeader: `Basic ${token}`,
-            proxyAuth: `${username}:${password}`
-        });
-    }
-    return pool;
-}
+function loadTunnelSecret() {
+    if (tunnelSecretCache) return tunnelSecretCache;
 
-function loadTunnelProxyPool() {
-    if (tunnelProxyPoolCache) return tunnelProxyPoolCache;
-
-    const envUser = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
-    const envPass = process.env.TUNNEL_PASSWORD ? String(process.env.TUNNEL_PASSWORD) : '';
-    const envListRaw = process.env.TUNNEL_PROXIES ? String(process.env.TUNNEL_PROXIES) : '';
-    if (envListRaw) {
-        const entries = envListRaw
-            .split(/[\n,;]+/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-        const pool = parseTunnelProxyPool(entries, envUser, envPass);
-        if (pool.length > 0) {
-            tunnelProxyPoolCache = pool;
-            return tunnelProxyPoolCache;
-        }
-    }
-
-    const envTunnel = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
-    if (envTunnel && envUser && envPass) {
-        tunnelProxyPoolCache = parseTunnelProxyPool([envTunnel], envUser, envPass);
-        if (tunnelProxyPoolCache.length > 0) return tunnelProxyPoolCache;
+    const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
+    const username = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
+    const password = process.env.TUNNEL_PASSWORD ? String(process.env.TUNNEL_PASSWORD) : '';
+    if (tunnelStr && username && password) {
+        tunnelSecretCache = { tunnel: tunnelStr, username, password };
+        return tunnelSecretCache;
     }
 
     if (fs.existsSync(tunnelSecretPath)) {
         const raw = fs.readFileSync(tunnelSecretPath, 'utf8');
         const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.proxies)) {
-            const entries = parsed.proxies.map((p) =>
-                p && typeof p === 'object'
-                    ? `${p.tunnel || ''}|${p.username || ''}|${p.password || ''}`
-                    : String(p || '')
-            );
-            const pool = parseTunnelProxyPool(entries, '', '');
-            if (pool.length > 0) {
-                tunnelProxyPoolCache = pool;
-                return tunnelProxyPoolCache;
-            }
-        } else {
-            const fileTunnel = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
-            const fileUser = parsed && parsed.username ? String(parsed.username) : '';
-            const filePass = parsed && parsed.password ? String(parsed.password) : '';
-            const pool = parseTunnelProxyPool([`${fileTunnel}|${fileUser}|${filePass}`], '', '');
-            if (pool.length > 0) {
-                tunnelProxyPoolCache = pool;
-                return tunnelProxyPoolCache;
-            }
+        const fileTunnel = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
+        const fileUser = parsed && parsed.username ? String(parsed.username) : '';
+        const filePass = parsed && parsed.password ? String(parsed.password) : '';
+        if (!fileTunnel || !fileUser || !filePass) {
+            throw new Error('crawler-secret.json missing fields');
         }
+        tunnelSecretCache = { tunnel: fileTunnel, username: fileUser, password: filePass };
+        return tunnelSecretCache;
     }
 
-    throw new Error('Missing tunnel proxy credentials. Set TUNNEL_PROXY/TUNNEL_USERNAME/TUNNEL_PASSWORD or TUNNEL_PROXIES.');
+    throw new Error('Missing tunnel proxy credentials. Set TUNNEL_PROXY/TUNNEL_USERNAME/TUNNEL_PASSWORD.');
 }
 
-function getTunnelProxy(index = 0) {
-    const pool = loadTunnelProxyPool();
-    return pool[index % pool.length];
+function getTunnelProxy() {
+    const secret = loadTunnelSecret();
+    const [host, portStr] = String(secret.tunnel).split(':');
+    const port = Number(portStr);
+    const token = Buffer.from(`${secret.username}:${secret.password}`).toString('base64');
+    return {
+        host,
+        port,
+        authHeader: `Basic ${token}`
+    };
 }
 
 function onTunnelProxySuccess() {
@@ -126,7 +83,13 @@ function onTunnelProxyFailure() {
 }
 
 function isTunnelProxyEnabled() {
+    if (tunnelProxyDisabledUntil && Date.now() < tunnelProxyDisabledUntil) return false;
     return !tunnelProxyDisabled;
+}
+
+function temporarilyDisableTunnelProxy(ms) {
+    const now = Date.now();
+    tunnelProxyDisabledUntil = Math.max(tunnelProxyDisabledUntil, now + ms);
 }
 
 function getBufferDirect(targetUrl, headers = {}, timeoutMs) {
@@ -294,18 +257,16 @@ const CI_RECOVERY_TIMEOUT = Number(
     crawler_config.config.ciRecoveryTimeout || crawler_config.config.ciFetchTimeout || 20000
 );
 const CI_DIRECT_FALLBACK = crawler_config.config.ciDirectFallback !== false;
+const CI_MAIN_MAX_RETRIES = Number(crawler_config.config.ciMainMaxRetries || 2);
+const CI_DIRECT_FALLBACK_MS = Number(crawler_config.config.ciDirectFallbackMs || 30000);
 const STOCK_FETCH_TIMEOUT_EFFECTIVE = IS_CI ? CI_MAIN_TIMEOUT : STOCK_FETCH_TIMEOUT;
 const STOCK_RETRY_BASE_DELAY = Number(crawler_config.config.retryBaseDelay || 200);
 const STOCK_RETRY_MAX_DELAY = Number(crawler_config.config.retryMaxDelay || 2500);
 const STOCK_SESSION_POOL_SIZE = Number(crawler_config.config.sessionPoolSize || 20);
-const STOCK_IP_POOL_SIZE = Number(crawler_config.config.ipPoolSize || 0);
-const STOCK_PER_IP_CONCURRENCY = Number(crawler_config.config.perIpConcurrency || 0);
 const STOCK_MAX_RETRIES = Number(crawler_config.config.stockMaxRetries || 3);
 const STOCK_RECOVERY_ROUNDS = Number(crawler_config.config.recoveryRounds || 1);
 const STOCK_RECOVERY_WORKER_CAP = Number(crawler_config.config.recoveryWorkerCap || 60);
 const STOCK_RECOVERY_MAX_RETRIES = Number(crawler_config.config.recoveryMaxRetries || 6);
-const RETRY_UNTIL_DONE = crawler_config.config.retryUntilDone !== false;
-const MAX_RETRY_ROUNDS = Number(crawler_config.config.maxRetryRounds || 12);
 const STOCK_STALL_RESET_MS = 60000;
 const ADAPTIVE_CONCURRENCY_ENABLED = crawler_config.config.adaptiveConcurrency !== false;
 const ADAPTIVE_MIN_WORKERS = Number(crawler_config.config.adaptiveMinWorkers || 40);
@@ -322,8 +283,8 @@ const STOCK_REDUCE_REGEX = /增减持计划/;
 const STOCK_INVESTIGATE_REGEX = /立案调查/;
 
 // Agent 缓存，用于连接复用与并发优化
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 500 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 2000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 2000 });
 let tunnelHttpAgent = null;
 let tunnelHttpsAgent = null;
 let proxyHttpKeepAliveAgent = null;
@@ -347,29 +308,32 @@ function resetTunnelAgents() {
 
 function initTunnelAgents() {
     if (!tunnelHttpAgent || !tunnelHttpsAgent || !proxyHttpKeepAliveAgent) {
+        const secret = loadTunnelSecret();
+        const proxy = getTunnelProxy();
         const proxyConfig = {
-            host: getTunnelProxy(0).host,
-            port: getTunnelProxy(0).port,
-            proxyAuth: getTunnelProxy(0).proxyAuth
+            host: proxy.host,
+            port: proxy.port,
+            proxyAuth: `${secret.username}:${secret.password}`
         };
         tunnelHttpAgent = tunnel.httpOverHttp({
             proxy: proxyConfig,
-            maxSockets: 500
+            maxSockets: 2000
         });
         tunnelHttpsAgent = tunnel.httpsOverHttp({
             proxy: proxyConfig,
-            maxSockets: 500
+            maxSockets: 2000
         });
-        proxyHttpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });
+        proxyHttpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 2000 });
     }
 }
 
-function createTunnelSession({ maxSockets = 1, proxyIndex = 0, proxyOverride = null } = {}) {
-    const proxy = proxyOverride || getTunnelProxy(proxyIndex);
+function createTunnelSession({ maxSockets = 1 } = {}) {
+    const secret = loadTunnelSecret();
+    const proxy = getTunnelProxy();
     const proxyConfig = {
         host: proxy.host,
         port: proxy.port,
-        proxyAuth: proxy.proxyAuth
+        proxyAuth: `${secret.username}:${secret.password}`
     };
     const session = {
         proxy,
@@ -538,24 +502,22 @@ async function main() {
         } else {
             console.log(`Processing ${stocksToProcess.length} stocks`);
         }
-        const recoveryBaseDelay = Math.max(STOCK_RETRY_BASE_DELAY, 800);
-        const recoveryMaxDelay = Math.max(STOCK_RETRY_MAX_DELAY, 8000);
-        const recoveryTimeout = IS_CI ? CI_RECOVERY_TIMEOUT : Math.max(STOCK_FETCH_TIMEOUT, 15000);
-        let round = 0;
-        let failedStocks = stocksToProcess;
-        let prevFailedCount = Infinity;
-        let noProgressRounds = 0;
-        const maxRounds = RETRY_UNTIL_DONE ? Math.max(1, MAX_RETRY_ROUNDS) : Math.max(1, STOCK_RECOVERY_ROUNDS + 1);
-
-        while (failedStocks.length > 0 && round < maxRounds) {
-            if (round === 0) {
-                const result = await processStocks(failedStocks, { label: 'main' });
-                failedStocks = result.failedStocks;
-            } else {
-                console.log(`Retry round ${round}: ${failedStocks.length}`);
-                const result = await processStocks(failedStocks, {
-                    label: `retry${round}`,
-                    allowMultiIp: true,
+        let result = await processStocks(stocksToProcess, {
+            label: 'main',
+            stockRetryOverrides: IS_CI ? { maxRetries: CI_MAIN_MAX_RETRIES } : null
+        });
+        let failedStocks = result.failedStocks;
+        if (failedStocks.length > 0 && STOCK_RECOVERY_ROUNDS > 0) {
+            console.warn(`Main pass failed stocks: ${failedStocks.length}`);
+            const recoveryBaseDelay = Math.max(STOCK_RETRY_BASE_DELAY, 800);
+            const recoveryMaxDelay = Math.max(STOCK_RETRY_MAX_DELAY, 8000);
+            const recoveryTimeout = IS_CI ? CI_RECOVERY_TIMEOUT : Math.max(STOCK_FETCH_TIMEOUT, 15000);
+            for (let round = 1; round <= STOCK_RECOVERY_ROUNDS && failedStocks.length > 0; round += 1) {
+                console.log(`Recovery round ${round}: ${failedStocks.length}`);
+                result = await processStocks(failedStocks, {
+                    label: `recovery${round}`,
+                    workerCap: STOCK_RECOVERY_WORKER_CAP,
+                    sessionPoolSize: Math.min(STOCK_SESSION_POOL_SIZE, 10),
                     stockRetryOverrides: {
                         maxRetries: STOCK_RECOVERY_MAX_RETRIES,
                         baseDelay: recoveryBaseDelay,
@@ -565,22 +527,11 @@ async function main() {
                 });
                 failedStocks = result.failedStocks;
             }
-
-            if (failedStocks.length === 0) break;
-            if (failedStocks.length >= prevFailedCount) {
-                noProgressRounds += 1;
+            if (failedStocks.length > 0) {
+                console.warn(`Final failed stocks: ${failedStocks.length}`);
             } else {
-                noProgressRounds = 0;
+                console.log('Recovery done: all stocks succeeded');
             }
-            prevFailedCount = failedStocks.length;
-            if (noProgressRounds >= 2) break;
-            round += 1;
-        }
-
-        if (failedStocks.length > 0) {
-            console.warn(`Final failed stocks: ${failedStocks.length}`);
-        } else {
-            console.log('All stocks succeeded');
         }
         
         createStockInfoFile();
@@ -607,7 +558,7 @@ async function getAllStocks() {
     const CONCURRENCY_LIMIT = Math.max(1, Math.min(10, STOCK_LIST_CONCURRENCY));
     const pagesToFetch = Array.from({ length: totalPage - 1 }, (_, i) => i + 2);
     
-    const sessions = Array.from({ length: CONCURRENCY_LIMIT }, (_, i) => createTunnelSession({ proxyIndex: i }));
+    const sessions = Array.from({ length: CONCURRENCY_LIMIT }, () => createTunnelSession());
     const failedPages = [];
     try {
         for (let i = 0; i < pagesToFetch.length; i += CONCURRENCY_LIMIT) {
@@ -631,7 +582,7 @@ async function getAllStocks() {
             const RECOVERY_CONCURRENCY_LIMIT = CONCURRENCY_LIMIT;
             const recoverySessions = Array.from(
                 { length: RECOVERY_CONCURRENCY_LIMIT },
-                (_, i) => createTunnelSession({ proxyIndex: i })
+                () => createTunnelSession()
             );
             try {
                 for (let i = 0; i < failedPages.length; i += RECOVERY_CONCURRENCY_LIMIT) {
@@ -742,29 +693,15 @@ async function processStocks(stockList, opts = {}) {
         opts && opts.stockRetryOverrides && typeof opts.stockRetryOverrides === 'object'
             ? opts.stockRetryOverrides
             : null;
-    const allowMultiIp = opts && Object.prototype.hasOwnProperty.call(opts, 'allowMultiIp') ? !!opts.allowMultiIp : true;
-    const workerCountBase = Math.max(1, Math.min(totalStocks, workerCap));
-    const multiIpEnabled =
-        allowMultiIp && Number.isFinite(STOCK_IP_POOL_SIZE) && STOCK_IP_POOL_SIZE > 0 && Number.isFinite(STOCK_PER_IP_CONCURRENCY) && STOCK_PER_IP_CONCURRENCY > 0;
-    const workerCount = multiIpEnabled
-        ? Math.max(1, Math.min(workerCountBase, STOCK_IP_POOL_SIZE * STOCK_PER_IP_CONCURRENCY))
-        : workerCountBase;
+    const workerCount = Math.max(1, Math.min(totalStocks, TASK_COUNT, workerCap));
     const minConcurrency = Math.max(1, Math.min(workerCount, ADAPTIVE_MIN_WORKERS));
     let currentConcurrency =
         ADAPTIVE_CONCURRENCY_ENABLED && process.env.GITHUB_ACTIONS === 'true' ? minConcurrency : workerCount;
     const adaptiveWindowSize = Math.max(50, ADAPTIVE_WINDOW_SIZE);
-    const poolSize = Math.max(
-        1,
-        Math.min(
-            workerCount,
-            multiIpEnabled ? STOCK_IP_POOL_SIZE : sessionPoolSize
-        )
-    );
-    const maxSocketsPerSession = multiIpEnabled
-        ? Math.max(1, Math.min(STOCK_PER_IP_CONCURRENCY, Math.ceil(workerCount / poolSize)))
-        : Math.max(1, Math.ceil(workerCount / poolSize));
-    const sessions = Array.from({ length: poolSize }, (_, i) =>
-        createTunnelSession({ maxSockets: maxSocketsPerSession, proxyIndex: i })
+    const poolSize = Math.max(1, Math.min(workerCount, sessionPoolSize));
+    const maxSocketsPerSession = Math.max(1, Math.ceil(workerCount / poolSize));
+    const sessions = Array.from({ length: poolSize }, () =>
+        createTunnelSession({ maxSockets: maxSocketsPerSession })
     );
     const failedStocks = [];
     let idx = 0;
@@ -859,6 +796,9 @@ async function processStocks(stockList, opts = {}) {
                 if (session && typeof session.reset === 'function') session.reset();
             }
             resetTunnelAgents();
+            if (IS_CI && CI_DIRECT_FALLBACK) {
+                temporarilyDisableTunnelProxy(CI_DIRECT_FALLBACK_MS);
+            }
         }
         if (
             finishedCount < totalStocks &&
@@ -1099,7 +1039,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 try {
                     const url = `http://basic.10jqka.com.cn/${stockId}/`;
                     const directHtml = await withHardTimeout(
-                        fetchHtmlDirect(url, fetchTimeoutMs),
+                        fetchHtml(url, fetchTimeoutMs, null),
                         fetchTimeoutMs + 3000
                     );
                     if (directHtml && directHtml.length >= 500) {
@@ -1303,18 +1243,6 @@ async function fetchHtml(url, timeoutMs = 15000, session) {
     return iconv.decode(buffer, 'GBK');
 }
 
-async function fetchHtmlDirect(url, timeoutMs = 15000) {
-    const targetUrl = new URL(url);
-    const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
-        'Connection': 'keep-alive'
-    };
-    const buffer = await getBufferDirect(targetUrl, headers, timeoutMs);
-    return iconv.decode(buffer, 'GBK');
-}
-
 if (require.main === module) {
     main().catch(console.error);
 }
@@ -1322,7 +1250,6 @@ if (require.main === module) {
 module.exports = {
     fetchData,
     fetchHtml,
-    fetchHtmlDirect,
     _tunnelProxyState: {
         isEnabled: () => isTunnelProxyEnabled(),
         getFailureCount: () => tunnelProxyFailureCount
