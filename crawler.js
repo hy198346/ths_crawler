@@ -443,38 +443,53 @@ async function getAllStocks() {
     const CONCURRENCY_LIMIT = 3;
     const pagesToFetch = Array.from({ length: totalPage - 1 }, (_, i) => i + 2);
     
+    const sessions = Array.from({ length: CONCURRENCY_LIMIT }, () => createTunnelSession());
     const failedPages = [];
-    for (let i = 0; i < pagesToFetch.length; i += CONCURRENCY_LIMIT) {
-        const batchPages = pagesToFetch.slice(i, i + CONCURRENCY_LIMIT);
-        const promises = batchPages.map(page => getStocksByPage(page));
-        const results = await Promise.all(promises);
-        
-        for (let j = 0; j < results.length; j += 1) {
-            const result = results[j];
-            const page = batchPages[j];
-            if (result) {
-                allStockIds.push(...result.arr);
-            } else {
-                failedPages.push(page);
-            }
-        }
-    }
-
-    if (failedPages.length > 0) {
-        const prevTunnelDisabled = tunnelProxyDisabled;
-        tunnelProxyDisabled = true;
-        const RECOVERY_CONCURRENCY_LIMIT = 3;
-        for (let i = 0; i < failedPages.length; i += RECOVERY_CONCURRENCY_LIMIT) {
-            const batchPages = failedPages.slice(i, i + RECOVERY_CONCURRENCY_LIMIT);
-            const results = await Promise.all(batchPages.map(page => getStocksByPage(page)));
-            for (const result of results) {
+    try {
+        for (let i = 0; i < pagesToFetch.length; i += CONCURRENCY_LIMIT) {
+            const batchPages = pagesToFetch.slice(i, i + CONCURRENCY_LIMIT);
+            const results = await Promise.all(
+                batchPages.map((page, idx) => getStocksByPage(page, 0, sessions[idx]))
+            );
+            
+            for (let j = 0; j < results.length; j += 1) {
+                const result = results[j];
+                const page = batchPages[j];
                 if (result) {
                     allStockIds.push(...result.arr);
+                } else {
+                    failedPages.push(page);
                 }
             }
         }
-        if (!prevTunnelDisabled) {
-            tunnelProxyDisabled = false;
+
+        if (failedPages.length > 0) {
+            const RECOVERY_CONCURRENCY_LIMIT = 3;
+            const recoverySessions = Array.from(
+                { length: RECOVERY_CONCURRENCY_LIMIT },
+                () => createTunnelSession()
+            );
+            try {
+                for (let i = 0; i < failedPages.length; i += RECOVERY_CONCURRENCY_LIMIT) {
+                    const batchPages = failedPages.slice(i, i + RECOVERY_CONCURRENCY_LIMIT);
+                    const results = await Promise.all(
+                        batchPages.map((page, idx) => getStocksByPage(page, 0, recoverySessions[idx]))
+                    );
+                    for (const result of results) {
+                        if (result) {
+                            allStockIds.push(...result.arr);
+                        }
+                    }
+                }
+            } finally {
+                for (const session of recoverySessions) {
+                    if (session && typeof session.destroy === 'function') session.destroy();
+                }
+            }
+        }
+    } finally {
+        for (const session of sessions) {
+            if (session && typeof session.destroy === 'function') session.destroy();
         }
     }
 
@@ -499,7 +514,7 @@ async function getAllStocks() {
     return dedupedStocks;
 }
 
-async function getStocksByPage(page, retryCount = 0) {
+async function getStocksByPage(page, retryCount = 0, session) {
     const MAX_RETRIES = page === 1 ? 51 : 3;
     const RETRY_DELAY = page === 1 ? 0 : 5000;
     
@@ -525,7 +540,7 @@ async function getStocksByPage(page, retryCount = 0) {
             port: 80
         };
         
-        const data = await fetchData(options);
+        const data = await fetchData(options, session);
         if (!data || !data.data || !data.data.diff) {
             throw new Error('Invalid API response structure');
         }
@@ -536,12 +551,16 @@ async function getStocksByPage(page, retryCount = 0) {
         };
     } catch (error) {
         console.error(`Page ${page} error: ${error.message}`);
+        if (error && error.isTunnelProxyError && session && typeof session.reset === 'function') {
+            session.reset();
+            markTunnelProxyFailure({ resetGlobalAgents: false });
+        }
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying page ${page} (attempt ${retryCount + 1})...`);
             if (RETRY_DELAY > 0) {
                 await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
             }
-            return getStocksByPage(page, retryCount + 1);
+            return getStocksByPage(page, retryCount + 1, session);
         }
         console.error(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
         return null;
@@ -740,10 +759,13 @@ function getBackupFilePath() {
     return `${base}_${crawler_tools.timestamp()}${ext}`;
 }
 
-async function fetchData(options) {
+async function fetchData(options, session) {
     const protocol = options.port === 443 ? 'https:' : 'http:';
     const targetUrl = new URL(`${protocol}//${options.hostname}${options.path}`);
-    const buffer = await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout);
+    const buffer =
+        session && isTunnelProxyEnabled()
+            ? await getBufferViaTunnelProxySession(targetUrl, options.headers, options.timeout, session)
+            : await getBufferWithTunnelPolicy(targetUrl, options.headers, options.timeout);
     let str = buffer.toString();
     // Some endpoints may return JSONP like `callback({...})` if requested poorly, 
     // try to clean it up just in case, though Eastmoney mostly returns JSON with right params
