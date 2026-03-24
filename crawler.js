@@ -359,18 +359,26 @@ async function getAllStocks() {
             tunnelProxyDisabled = false;
         }
     }
+
+    const dedupedMap = new Map();
+    for (const stock of allStockIds) {
+        const key = stock && stock.f12 ? `${stock.f13}|${stock.f12}` : null;
+        if (!key) continue;
+        if (!dedupedMap.has(key)) dedupedMap.set(key, stock);
+    }
+    const dedupedStocks = Array.from(dedupedMap.values());
     
-    if (cachedStocks && allStockIds.length < cachedStocks.length) {
+    if (cachedStocks && dedupedStocks.length < cachedStocks.length) {
         console.warn(
-            `Fetched stock list size (${allStockIds.length}) smaller than cached (${cachedStocks.length}); using cached list.`
+            `Fetched stock list size (${dedupedStocks.length}) smaller than cached (${cachedStocks.length}); using cached list.`
         );
         return cachedStocks;
     }
 
-    if (allStockIds.length >= initialPage.total) {
-        saveStockListCache(allStockIds);
+    if (!cachedStocks || dedupedStocks.length > cachedStocks.length) {
+        saveStockListCache(dedupedStocks);
     }
-    return allStockIds;
+    return dedupedStocks;
 }
 
 async function getStocksByPage(page, retryCount = 0) {
@@ -378,7 +386,12 @@ async function getStocksByPage(page, retryCount = 0) {
     const RETRY_DELAY = page === 1 ? 0 : 5000;
     
     try {
-        const host = "51.push2.eastmoney.com";
+        const hosts = [
+            "51.push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+            "push2.eastmoney.com"
+        ];
+        const host = hosts[retryCount % hosts.length];
         const path = `/api/qt/clist/get?pn=${page}&pz=100&po=1&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048,m:0+t:83&fields=f12,f13,f14`;
         
         const options = {

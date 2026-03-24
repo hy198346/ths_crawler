@@ -1,5 +1,11 @@
 name: Execute JSON Script
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '7 11,23 * * *'  # UTC时间（对应北京时间7:07,19:07等）
   workflow_dispatch:
