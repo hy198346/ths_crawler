@@ -252,6 +252,12 @@ const STOCK_RECOVERY_ROUNDS = Number(crawler_config.config.recoveryRounds || 1);
 const STOCK_RECOVERY_WORKER_CAP = Number(crawler_config.config.recoveryWorkerCap || 60);
 const STOCK_RECOVERY_MAX_RETRIES = Number(crawler_config.config.recoveryMaxRetries || 6);
 const STOCK_STALL_RESET_MS = 60000;
+const ADAPTIVE_CONCURRENCY_ENABLED = crawler_config.config.adaptiveConcurrency !== false;
+const ADAPTIVE_MIN_WORKERS = Number(crawler_config.config.adaptiveMinWorkers || 40);
+const ADAPTIVE_WINDOW_SIZE = Number(crawler_config.config.adaptiveWindowSize || 200);
+const ADAPTIVE_HANGUP_HIGH = Number(crawler_config.config.adaptiveHangupHigh || 0.12);
+const ADAPTIVE_HANGUP_LOW = Number(crawler_config.config.adaptiveHangupLow || 0.03);
+const ADAPTIVE_ADJUST_COOLDOWN_MS = Number(crawler_config.config.adaptiveAdjustCooldownMs || 15000);
 
 // 正则表达式常量
 const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
@@ -667,6 +673,9 @@ async function processStocks(stockList, opts = {}) {
             ? opts.stockRetryOverrides
             : null;
     const workerCount = Math.max(1, Math.min(totalStocks, TASK_COUNT, workerCap));
+    let currentConcurrency = workerCount;
+    const minConcurrency = Math.max(1, Math.min(workerCount, ADAPTIVE_MIN_WORKERS));
+    const adaptiveWindowSize = Math.max(50, ADAPTIVE_WINDOW_SIZE);
     const poolSize = Math.max(1, Math.min(workerCount, sessionPoolSize));
     const maxSocketsPerSession = Math.max(1, Math.ceil(workerCount / poolSize));
     const sessions = Array.from({ length: poolSize }, () =>
@@ -684,6 +693,22 @@ async function processStocks(stockList, opts = {}) {
     let lastFinishedCount = 0;
     let lastProgressAt = startedAt;
     let stallResetAt = 0;
+    let lastAdjustAt = 0;
+    const recent = [];
+    let recentFail = 0;
+    let recentHangup = 0;
+
+    const pushRecent = ({ ok, hangup }) => {
+        const item = { ok: !!ok, hangup: !!hangup };
+        recent.push(item);
+        if (!item.ok) recentFail += 1;
+        if (item.hangup) recentHangup += 1;
+        while (recent.length > adaptiveWindowSize) {
+            const old = recent.shift();
+            if (old && !old.ok) recentFail -= 1;
+            if (old && old.hangup) recentHangup -= 1;
+        }
+    };
 
     const maybeSleep = async () => {
         if (SLEEP_TIME <= 0) return;
@@ -706,11 +731,32 @@ async function processStocks(stockList, opts = {}) {
         const avgRate = elapsedMs > 0 ? (finishedCount * 1000) / elapsedMs : 0;
         const percent = totalStocks > 0 ? Math.min(100, (finishedCount / totalStocks) * 100) : 0;
         const prefix = label ? `${label} ` : '';
+        const windowN = recent.length;
+        const windowFailRate = windowN > 0 ? recentFail / windowN : 0;
+        const windowHangupRate = windowN > 0 ? recentHangup / windowN : 0;
         console.log(
-            `${prefix}Progress: ${percent.toFixed(2)}% (${finishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s`
+            `${prefix}Progress: ${percent.toFixed(2)}% (${finishedCount}/${totalStocks}) ok=${successCount} fail=${failCount} conc=${currentConcurrency}/${workerCount} rate=${rate.toFixed(2)}/s avg=${avgRate.toFixed(2)}/s winFail=${(windowFailRate * 100).toFixed(1)}% winHangup=${(windowHangupRate * 100).toFixed(1)}%`
         );
         if (finishedDelta > 0) {
             lastProgressAt = now;
+        }
+        if (ADAPTIVE_CONCURRENCY_ENABLED && windowN >= 50 && now - lastAdjustAt >= ADAPTIVE_ADJUST_COOLDOWN_MS) {
+            if (windowHangupRate >= ADAPTIVE_HANGUP_HIGH || windowFailRate >= 0.25) {
+                const next = Math.max(minConcurrency, Math.floor(currentConcurrency * 0.8));
+                if (next !== currentConcurrency) {
+                    currentConcurrency = next;
+                    lastAdjustAt = now;
+                    console.warn(`${prefix}Concurrency down: ${currentConcurrency}/${workerCount}`);
+                }
+            } else if (windowHangupRate <= ADAPTIVE_HANGUP_LOW && windowFailRate <= 0.08) {
+                const step = Math.max(1, Math.floor(workerCount * 0.05));
+                const next = Math.min(workerCount, currentConcurrency + step);
+                if (next !== currentConcurrency) {
+                    currentConcurrency = next;
+                    lastAdjustAt = now;
+                    console.log(`${prefix}Concurrency up: ${currentConcurrency}/${workerCount}`);
+                }
+            }
         }
         if (
             finishedCount < totalStocks &&
@@ -733,6 +779,10 @@ async function processStocks(stockList, opts = {}) {
         (async () => {
             const session = sessions[workerIdx % poolSize];
             while (true) {
+                if (ADAPTIVE_CONCURRENCY_ENABLED && workerIdx >= currentConcurrency) {
+                    await new Promise((resolve) => setTimeout(resolve, 200));
+                    continue;
+                }
                 const i = idx;
                 idx += 1;
                 if (i >= totalStocks) return;
@@ -747,7 +797,10 @@ async function processStocks(stockList, opts = {}) {
                     exchangeId = "2";
                 }
 
-                const ok = await getStockInfo(stockId, exchangeId, session, stockRetryOverrides);
+                const result = await getStockInfo(stockId, exchangeId, session, stockRetryOverrides);
+                const ok = !!(result && result.ok);
+                const hangup = !!(result && result.hangup);
+                pushRecent({ ok, hangup });
                 if (ok) {
                     successCount += 1;
                 } else {
@@ -821,6 +874,12 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
         overrides && Number.isFinite(overrides.baseDelay) ? Number(overrides.baseDelay) : STOCK_RETRY_BASE_DELAY;
     const maxDelayMs =
         overrides && Number.isFinite(overrides.maxDelay) ? Number(overrides.maxDelay) : STOCK_RETRY_MAX_DELAY;
+    let lastReason = 'unknown';
+    let lastStatusCode = null;
+    let hadHangup = false;
+    let hadTimeout = false;
+    let hadHardTimeout = false;
+    let hadBlocked = false;
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
@@ -845,9 +904,11 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             );
             if (!coreViewText && !mainBusinessText) {
                 const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(html);
-                const err = new Error(blocked ? 'Blocked HTML response' : 'Missing required HTML fields');
-                err.isTunnelProxyError = true;
-                throw err;
+                if (blocked) {
+                    const err = new Error('Blocked HTML response');
+                    err.isTunnelProxyError = true;
+                    throw err;
+                }
             }
             
             // 提取核心信息
@@ -865,11 +926,43 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
             extractSpecialEvents($, stockPrefix);
             
             onTunnelProxySuccess();
-            return true;
+            return {
+                ok: true,
+                reason: lastReason,
+                statusCode: lastStatusCode,
+                hangup: hadHangup,
+                timeout: hadTimeout,
+                hardTimeout: hadHardTimeout,
+                blocked: hadBlocked
+            };
         } catch (error) {
             console.error(`Stock ${stockId} attempt ${attempt} error: ${error.message}`);
             const statusCode = error && typeof error.statusCode === 'number' ? error.statusCode : null;
+            lastStatusCode = statusCode;
             const isBlocked = statusCode === 517 || statusCode === 403 || statusCode === 429 || statusCode === 503;
+            const msg = error && error.message ? String(error.message) : '';
+            if (isBlocked) {
+                hadBlocked = true;
+                lastReason = 'blocked';
+            } else if (statusCode && statusCode >= 500) {
+                lastReason = 'http_5xx';
+            } else if (msg.includes('socket hang up')) {
+                hadHangup = true;
+                lastReason = 'socket_hang_up';
+            } else if (msg.includes('Request timeout')) {
+                hadTimeout = true;
+                lastReason = 'timeout';
+            } else if (msg.includes('Hard timeout')) {
+                hadHardTimeout = true;
+                lastReason = 'hard_timeout';
+            } else if (msg.includes('Blocked HTML response')) {
+                hadBlocked = true;
+                lastReason = 'blocked_html';
+            } else if (msg.includes('Missing required HTML fields')) {
+                lastReason = 'invalid_html';
+            } else {
+                lastReason = 'other';
+            }
             if ((error && error.isTunnelProxyError) && session && typeof session.reset === 'function') {
                 session.reset();
                 markTunnelProxyFailure({ resetGlobalAgents: false });
@@ -889,7 +982,15 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
     }
     
     console.error(`Failed to fetch stock ${stockId} after ${MAX_RETRIES} attempts`);
-    return false;
+    return {
+        ok: false,
+        reason: lastReason,
+        statusCode: lastStatusCode,
+        hangup: hadHangup,
+        timeout: hadTimeout,
+        hardTimeout: hadHardTimeout,
+        blocked: hadBlocked
+    };
 }
 
 function extractSpecialEvents($, stockPrefix) {

@@ -30,7 +30,13 @@ const crawler_config = {
     stockMaxRetries : 3,
     recoveryRounds : 2,
     recoveryWorkerCap : 40,
-    recoveryMaxRetries : 6
+    recoveryMaxRetries : 6,
+    adaptiveConcurrency : true,
+    adaptiveMinWorkers : 40,
+    adaptiveWindowSize : 200,
+    adaptiveHangupHigh : 0.12,
+    adaptiveHangupLow : 0.03,
+    adaptiveAdjustCooldownMs : 15000
 }
 
 exports.config = crawler_config;
