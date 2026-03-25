@@ -5,6 +5,7 @@ const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require('child_process');
 const { Buffer } = require('buffer');
 const { URL } = require('url');
 
@@ -19,10 +20,10 @@ let tunnelProxyDisabledUntil = 0;
 let tunnelProxyPreferredUntil = 0;
 
 const tunnelSecretPath = path.join(__dirname, 'crawler-secret.json');
-let tunnelSecretCache = null;
+let tunnelSecretCache;
 
 function loadTunnelSecret() {
-    if (tunnelSecretCache) return tunnelSecretCache;
+    if (tunnelSecretCache !== undefined) return tunnelSecretCache;
 
     const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
     const username = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
@@ -33,23 +34,32 @@ function loadTunnelSecret() {
     }
 
     if (fs.existsSync(tunnelSecretPath)) {
-        const raw = fs.readFileSync(tunnelSecretPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        const fileTunnel = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
-        const fileUser = parsed && parsed.username ? String(parsed.username) : '';
-        const filePass = parsed && parsed.password ? String(parsed.password) : '';
-        if (!fileTunnel || !fileUser || !filePass) {
-            throw new Error('crawler-secret.json missing fields');
+        try {
+            const raw = fs.readFileSync(tunnelSecretPath, 'utf8');
+            const parsed = JSON.parse(raw);
+            const fileTunnel = parsed && parsed.tunnel ? String(parsed.tunnel) : '';
+            const fileUser = parsed && parsed.username ? String(parsed.username) : '';
+            const filePass = parsed && parsed.password ? String(parsed.password) : '';
+            if (fileTunnel && fileUser && filePass) {
+                tunnelSecretCache = { tunnel: fileTunnel, username: fileUser, password: filePass };
+                return tunnelSecretCache;
+            }
+            console.warn('crawler-secret.json 字段不完整，将使用直连模式');
+        } catch (e) {
+            console.warn('crawler-secret.json 读取失败，将使用直连模式');
         }
-        tunnelSecretCache = { tunnel: fileTunnel, username: fileUser, password: filePass };
-        return tunnelSecretCache;
     }
 
-    throw new Error('Missing tunnel proxy credentials. Set TUNNEL_PROXY/TUNNEL_USERNAME/TUNNEL_PASSWORD.');
+    tunnelSecretCache = null;
+    if (process.env.GITHUB_ACTIONS === 'true') {
+        console.warn('未配置隧道代理凭据（TUNNEL_PROXY/TUNNEL_USERNAME/TUNNEL_PASSWORD），将使用直连模式');
+    }
+    return tunnelSecretCache;
 }
 
 function getTunnelProxy() {
     const secret = loadTunnelSecret();
+    if (!secret) return null;
     const [host, portStr] = String(secret.tunnel).split(':');
     const port = Number(portStr);
     const token = Buffer.from(`${secret.username}:${secret.password}`).toString('base64');
@@ -84,6 +94,7 @@ function onTunnelProxyFailure() {
 }
 
 function isTunnelProxyEnabled() {
+    if (!loadTunnelSecret()) return false;
     if (tunnelProxyDisabledUntil && Date.now() < tunnelProxyDisabledUntil) return false;
     return !tunnelProxyDisabled;
 }
@@ -301,6 +312,7 @@ let tunnelHttpAgent = null;
 let tunnelHttpsAgent = null;
 let proxyHttpKeepAliveAgent = null;
 const STOCK_LIST_CACHE_PATH = path.join(__dirname, 'stock_list_cache.json');
+const STOCK_LIST_SAVED_PATH = path.join(__dirname, 'stock_list.json');
 
 function resetTunnelAgents() {
     try {
@@ -322,6 +334,7 @@ function initTunnelAgents() {
     if (!tunnelHttpAgent || !tunnelHttpsAgent || !proxyHttpKeepAliveAgent) {
         const secret = loadTunnelSecret();
         const proxy = getTunnelProxy();
+        if (!secret || !proxy) return;
         const proxyConfig = {
             host: proxy.host,
             port: proxy.port,
@@ -342,6 +355,25 @@ function initTunnelAgents() {
 function createTunnelSession({ maxSockets = 1 } = {}) {
     const secret = loadTunnelSecret();
     const proxy = getTunnelProxy();
+    if (!secret || !proxy) {
+        const session = {
+            proxy: null,
+            proxyHttpAgent: new http.Agent({ keepAlive: true, maxSockets }),
+            proxyHttpsAgent: null
+        };
+        session.reset = () => {
+            try {
+                if (session.proxyHttpAgent && typeof session.proxyHttpAgent.destroy === 'function') session.proxyHttpAgent.destroy();
+            } catch {}
+            session.proxyHttpAgent = new http.Agent({ keepAlive: true, maxSockets });
+        };
+        session.destroy = () => {
+            try {
+                if (session.proxyHttpAgent && typeof session.proxyHttpAgent.destroy === 'function') session.proxyHttpAgent.destroy();
+            } catch {}
+        };
+        return session;
+    }
     const proxyConfig = {
         host: proxy.host,
         port: proxy.port,
@@ -375,6 +407,11 @@ function createTunnelSession({ maxSockets = 1 } = {}) {
 
 function getBufferViaTunnelProxySession(targetUrl, headers = {}, timeoutMs, session) {
     const isHttps = targetUrl.protocol === 'https:';
+    if (!session || !session.proxy) {
+        const err = new Error('Tunnel proxy session not configured');
+        err.isTunnelProxyError = true;
+        return Promise.reject(err);
+    }
     if (!isHttps) {
         return new Promise((resolve, reject) => {
             const req = http.get(
@@ -463,14 +500,126 @@ function loadStockListCache() {
     }
 }
 
+function normalizeStockList(stocks) {
+    const arr = Array.isArray(stocks) ? stocks : [];
+    const normalized = [];
+    for (const item of arr) {
+        if (!item) continue;
+        const f12 = item.f12 != null ? String(item.f12) : '';
+        const f13 = item.f13 != null ? Number(item.f13) : NaN;
+        if (!f12 || !Number.isFinite(f13)) continue;
+        const f14 = item.f14 != null ? String(item.f14) : '';
+        normalized.push({ f12, f13, f14 });
+    }
+    normalized.sort((a, b) => (a.f13 - b.f13) || a.f12.localeCompare(b.f12));
+    return normalized;
+}
+
+function loadStockListSaved() {
+    try {
+        if (!fs.existsSync(STOCK_LIST_SAVED_PATH)) return null;
+        const raw = fs.readFileSync(STOCK_LIST_SAVED_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        const stocks = parsed && Array.isArray(parsed.stocks) ? parsed.stocks : null;
+        if (!stocks || stocks.length === 0) return null;
+        return stocks;
+    } catch {
+        return null;
+    }
+}
+
 function saveStockListCache(stocks) {
     try {
         fs.writeFileSync(
             STOCK_LIST_CACHE_PATH,
-            JSON.stringify({ updatedAt: Date.now(), stocks }),
+            JSON.stringify({ updatedAt: Date.now(), stocks }, null, 2),
             'utf8'
         );
     } catch {}
+}
+
+function saveStockListSaved(stocks) {
+    try {
+        fs.writeFileSync(
+            STOCK_LIST_SAVED_PATH,
+            JSON.stringify({ updatedAt: Date.now(), stocks }, null, 2),
+            'utf8'
+        );
+    } catch {}
+}
+
+function shouldPushStockListToGh() {
+    if (process.env.STOCK_LIST_PUSH_GH) return process.env.STOCK_LIST_PUSH_GH === 'true';
+    return process.env.GITHUB_ACTIONS === 'true';
+}
+
+function tryGitCommitAndPushStockList({ message }) {
+    if (!shouldPushStockListToGh()) return;
+    try {
+        execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: __dirname, stdio: 'ignore' });
+    } catch {
+        return;
+    }
+    try {
+        if (process.env.GITHUB_ACTIONS === 'true') {
+            let name = '';
+            let email = '';
+            try {
+                name = String(execFileSync('git', ['config', 'user.name'], { cwd: __dirname })).trim();
+            } catch {}
+            try {
+                email = String(execFileSync('git', ['config', 'user.email'], { cwd: __dirname })).trim();
+            } catch {}
+            if (!name) execFileSync('git', ['config', 'user.name', 'github-actions[bot]'], { cwd: __dirname });
+            if (!email) execFileSync('git', ['config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], { cwd: __dirname });
+        }
+    } catch {}
+
+    const relativePath = path.relative(__dirname, STOCK_LIST_SAVED_PATH).split('\\').join('/');
+    let hasChange = false;
+    try {
+        const status = String(
+            execFileSync('git', ['status', '--porcelain', '--', relativePath], { cwd: __dirname })
+        ).trim();
+        hasChange = !!status;
+    } catch {
+        return;
+    }
+    if (!hasChange) return;
+
+    try {
+        execFileSync('git', ['add', '--', relativePath], { cwd: __dirname, stdio: 'inherit' });
+        execFileSync('git', ['commit', '-m', message], { cwd: __dirname, stdio: 'inherit' });
+    } catch {
+        return;
+    }
+
+    try {
+        execFileSync('git', ['push'], { cwd: __dirname, stdio: 'inherit' });
+    } catch {}
+}
+
+function resolveStockList({ fetchedStocks, savedStocks, cachedStocks }) {
+    const baselineStocks = savedStocks || cachedStocks;
+    const fetched = Array.isArray(fetchedStocks) ? fetchedStocks : [];
+    const baseline = Array.isArray(baselineStocks) ? baselineStocks : null;
+    const hasSaved = Array.isArray(savedStocks) && savedStocks.length > 0;
+
+    if (!baseline && fetched.length === 0) {
+        return { stocks: [], source: 'empty', updateSaved: false, updateCache: false };
+    }
+    if (baseline && (fetched.length === 0 || fetched.length < baseline.length)) {
+        return {
+            stocks: baseline,
+            source: savedStocks ? 'saved' : 'cache',
+            updateSaved: !hasSaved,
+            updateCache: !cachedStocks || cachedStocks.length < baseline.length
+        };
+    }
+
+    const updateCache = !baseline || fetched.length > baseline.length;
+    const updateSaved = !hasSaved || updateCache;
+    return { stocks: fetched, source: 'fetched', updateSaved, updateCache };
 }
 
 // 全局状态
@@ -557,11 +706,12 @@ async function main() {
 }
 
 async function getAllStocks() {
+    const savedStocks = loadStockListSaved();
     const cachedStocks = loadStockListCache();
     const allStockIds = [];
     const initialPage = await getStocksByPage(1);
     
-    if (!initialPage) return cachedStocks || [];
+    if (!initialPage) return (savedStocks || cachedStocks) || [];
     
     const totalPage = Math.ceil(initialPage.total / 100);
     allStockIds.push(...initialPage.arr);
@@ -626,19 +776,30 @@ async function getAllStocks() {
         if (!key) continue;
         if (!dedupedMap.has(key)) dedupedMap.set(key, stock);
     }
-    const dedupedStocks = Array.from(dedupedMap.values());
+    const dedupedStocks = normalizeStockList(Array.from(dedupedMap.values()));
     
-    if (cachedStocks && dedupedStocks.length < cachedStocks.length) {
+    const decision = resolveStockList({
+        fetchedStocks: dedupedStocks,
+        savedStocks,
+        cachedStocks
+    });
+    const baselineStocks = savedStocks || cachedStocks;
+    if ((decision.source === 'saved' || decision.source === 'cache') && baselineStocks) {
         console.warn(
-            `Fetched stock list size (${dedupedStocks.length}) smaller than cached (${cachedStocks.length}); using cached list.`
+            `Fetched stock list size (${dedupedStocks.length}) smaller than saved (${baselineStocks.length}); using saved list.`
         );
-        return cachedStocks;
     }
 
-    if (!cachedStocks || dedupedStocks.length > cachedStocks.length) {
-        saveStockListCache(dedupedStocks);
+    if (decision.updateSaved) {
+        saveStockListSaved(decision.stocks);
+        saveStockListCache(decision.stocks);
+        tryGitCommitAndPushStockList({
+            message: `Update stock list (${decision.stocks.length})`
+        });
+    } else if (decision.updateCache) {
+        saveStockListCache(decision.stocks);
     }
-    return dedupedStocks;
+    return decision.stocks;
 }
 
 async function getStocksByPage(page, retryCount = 0, session) {
@@ -1216,8 +1377,14 @@ if (require.main === module) {
 module.exports = {
     fetchData,
     fetchHtml,
+    getAllStocks,
     _tunnelProxyState: {
         isEnabled: () => isTunnelProxyEnabled(),
         getFailureCount: () => tunnelProxyFailureCount
+    },
+    _stockList: {
+        normalize: normalizeStockList,
+        loadSaved: loadStockListSaved,
+        resolve: resolveStockList
     }
 };
