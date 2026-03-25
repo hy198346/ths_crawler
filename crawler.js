@@ -838,6 +838,7 @@ async function processStocks(stockList, opts = {}) {
         (async () => {
             const session = sessions[workerIdx % poolSize];
             while (true) {
+                if (idx >= totalStocks) return;
                 if (ADAPTIVE_CONCURRENCY_ENABLED && workerIdx >= currentConcurrency) {
                     await new Promise((resolve) => setTimeout(resolve, 200));
                     continue;
