@@ -37,6 +37,33 @@ function getExternUserFileSizeForNotice() {
   }
 }
 
+function getAnnouncementSummaryForNotice() {
+  const annPath = path.resolve(__dirname, 'extern_user_ann.txt');
+  const maxLines = Number(process.env.ANNOUNCE_NOTICE_MAX_LINES || 30);
+  const maxChars = Number(process.env.ANNOUNCE_NOTICE_MAX_CHARS || 4000);
+  try {
+    const raw = fs.readFileSync(annPath, 'utf8');
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const out = [];
+    let used = 0;
+    for (let i = 0; i < lines.length && out.length < maxLines; i += 1) {
+      const parts = lines[i].split('|');
+      if (parts.length < 5) continue;
+      const stockId = parts[1];
+      const text = parts[3];
+      const one = `- ${stockId} ${text}`;
+      used += one.length;
+      if (used > maxChars) break;
+      out.push(one);
+    }
+    if (out.length === 0) return '';
+    const more = lines.length > out.length ? `\n\n...(${lines.length - out.length} 条未展示)` : '';
+    return `### 📌 公告摘要（type 22）\n\n${out.join('\n')}${more}`;
+  } catch (e) {
+    return '';
+  }
+}
+
 // 发送消息到Server酱的函数
 function sendServerChan(message) {
   if (!SERVERCHAN_KEY) {
@@ -131,6 +158,7 @@ function runCrawler() {
         const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
         const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
         const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
+        const annSummary = getAnnouncementSummaryForNotice();
         const successMessage = [
           `### ✅ 爬虫任务成功执行`,
           `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -140,7 +168,8 @@ function runCrawler() {
           `**股票总数**: ${totalStockCount}`,
           `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`,
-          `**输出摘要**: ${stdout.trim().slice(-100)}`
+          `**输出摘要**: ${stdout.trim().slice(-100)}`,
+          annSummary
         ].join('\n\n');
         
         sendServerChan(successMessage).finally(() => process.exit(0));

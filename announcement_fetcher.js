@@ -2,6 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const tunnel = require('tunnel');
 const zlib = require('zlib');
+let pdfParse = null;
+try {
+    pdfParse = require('pdf-parse');
+} catch {}
 
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
 const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 400);
@@ -9,6 +13,10 @@ const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
 const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
+const ANNOUNCEMENT_MAX_PER_STOCK_DAY = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_DAY || 3);
+const ANNOUNCEMENT_PDF_CONCURRENCY = Number(process.env.ANNOUNCEMENT_PDF_CONCURRENCY || 2);
+const ANNOUNCEMENT_PDF_MAX_CHARS = Number(process.env.ANNOUNCEMENT_PDF_MAX_CHARS || 8000);
+const ANNOUNCEMENT_PDF_MAX_BYTES = Number(process.env.ANNOUNCEMENT_PDF_MAX_BYTES || 8000000);
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
@@ -92,6 +100,39 @@ function cninfoEpochMs(v) {
     }
     const parsed = Date.parse(s);
     return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildPdfUrl(adjunctUrl) {
+    const u0 = String(adjunctUrl || '').trim();
+    if (!u0) return '';
+    if (u0.startsWith('http://') || u0.startsWith('https://')) return u0;
+    const u = u0.startsWith('/') ? u0 : `/${u0}`;
+    return `https://static.cninfo.com.cn${u}`;
+}
+
+async function fetchAnnouncementPdfText(ann) {
+    if (!pdfParse) return '';
+    const pdfUrl = buildPdfUrl(ann && ann.adjunctUrl ? ann.adjunctUrl : '');
+    if (!pdfUrl) return '';
+    try {
+        const res = await requestBuffer(new URL(pdfUrl), {
+            method: 'GET',
+            headers: { 'Accept-Encoding': 'identity' },
+            timeoutMs: CNINFO_TIMEOUT_MS
+        });
+        const buf = res && res.buf ? res.buf : null;
+        if (!buf || !buf.length) return '';
+        if (ANNOUNCEMENT_PDF_MAX_BYTES > 0 && buf.length > ANNOUNCEMENT_PDF_MAX_BYTES) return '';
+        const parsed = await pdfParse(buf);
+        const text = parsed && parsed.text ? String(parsed.text) : '';
+        let s = text.replace(/\s+/g, ' ').trim();
+        if (ANNOUNCEMENT_PDF_MAX_CHARS > 0 && s.length > ANNOUNCEMENT_PDF_MAX_CHARS) {
+            s = s.slice(0, ANNOUNCEMENT_PDF_MAX_CHARS);
+        }
+        return s;
+    } catch (e) {
+        return '';
+    }
 }
 
 function formatCninfoTime(v) {
@@ -236,10 +277,10 @@ async function cninfoQuery({ seDate, pageNum, pageSize }) {
     return j;
 }
 
-async function cninfoDailyLatestByStock(dateStr) {
+async function cninfoDailyByStock(dateStr) {
     const seDate = `${dateStr}~${dateStr}`;
-    const seen = new Set();
     const out = new Map();
+    const seenAnn = new Set();
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
     const pageSize = Number.isFinite(CNINFO_PAGE_SIZE) && CNINFO_PAGE_SIZE > 0 ? CNINFO_PAGE_SIZE : 50;
     const stallLimit = Number.isFinite(CNINFO_STALL_PAGES) && CNINFO_STALL_PAGES > 0 ? Math.floor(CNINFO_STALL_PAGES) : 0;
@@ -261,24 +302,48 @@ async function cninfoDailyLatestByStock(dateStr) {
             break;
         }
         console.log(`ANN CNINFO items: date=${dateStr} page=${page} items=${items.length}`);
-        let added = 0;
+        let addedNewStock = 0;
+        let addedNewAnn = 0;
         for (const item of items) {
             const secCode = String(item.secCode || item.sec_code || '').trim();
             if (!secCode) continue;
-            if (seen.has(secCode)) continue;
-            seen.add(secCode);
-            added++;
-            out.set(secCode, {
-                secCode,
-                secName: String(item.secName || item.sec_name || '').trim(),
-                announcementTime: formatCninfoTime(item.announcementTime || item.announcement_time || ''),
-                announcementEpochMs: cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0,
-                announcementTitle: String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
-            });
+            const announcementId = String(item.announcementId || item.announcement_id || '').trim();
+            if (announcementId && seenAnn.has(announcementId)) continue;
+            if (announcementId) seenAnn.add(announcementId);
+            const epochMs = cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0;
+            const title = String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+            const adjunctUrl = String(item.adjunctUrl || item.adjunct_url || '').trim();
+            const timeStr = formatCninfoTime(item.announcementTime || item.announcement_time || '');
+            let entry = out.get(secCode);
+            if (!entry) {
+                entry = {
+                    secCode,
+                    secName: String(item.secName || item.sec_name || '').trim(),
+                    latestEpochMs: epochMs,
+                    latestTime: timeStr,
+                    announcements: []
+                };
+                out.set(secCode, entry);
+                addedNewStock++;
+            }
+            if (entry.announcements.length < ANNOUNCEMENT_MAX_PER_STOCK_DAY) {
+                entry.announcements.push({
+                    announcementId,
+                    title,
+                    time: timeStr,
+                    epochMs,
+                    adjunctUrl
+                });
+                addedNewAnn++;
+            }
+            if (epochMs > (entry.latestEpochMs || 0)) {
+                entry.latestEpochMs = epochMs;
+                entry.latestTime = timeStr;
+            }
         }
-        console.log(`ANN CNINFO unique: date=${dateStr} uniqueStocks=${seen.size}`);
-        if (added === 0) {
-            stallCount++;
+        console.log(`ANN CNINFO unique: date=${dateStr} uniqueStocks=${out.size}`);
+        if (addedNewStock === 0 && addedNewAnn === 0) {
+            stallCount += 1;
         } else {
             stallCount = 0;
         }
@@ -290,29 +355,28 @@ async function cninfoDailyLatestByStock(dateStr) {
     return out;
 }
 
-async function cninfoLatestForTodayAndYesterday() {
+async function cninfoPickDayForTodayAndYesterday() {
     const today = cninfoDateString(0);
     const yesterday = cninfoDateString(-1);
-    const todayMap = await cninfoDailyLatestByStock(today);
-    const yMap = await cninfoDailyLatestByStock(yesterday);
-
+    const todayMap = await cninfoDailyByStock(today);
+    const yMap = await cninfoDailyByStock(yesterday);
     const merged = new Map();
     for (const [k, v] of todayMap.entries()) merged.set(k, v);
     for (const [k, v] of yMap.entries()) {
-        const cur = merged.get(k);
-        if (!cur || (v.announcementEpochMs || 0) > (cur.announcementEpochMs || 0)) merged.set(k, v);
+        if (!merged.has(k)) merged.set(k, v);
     }
     return merged;
 }
 
-async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars) {
+async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars, rawText = '') {
     const fallback = cutByChars(announcementTitle || '', maxChars);
     if (!LLM_API_KEY) {
         llmFallbackCnt++;
         return fallback;
     }
     const titleOneLine = cleanOneLine(announcementTitle || '');
-    const basePrompt = `请将以下公告信息浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行。若信息不足请给出合理解读但不要照抄标题：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine}`;
+    const payload = cleanOneLine(rawText || '') || titleOneLine;
+    const basePrompt = `请将以下公告内容浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行。若同一天多份公告请合并概括。不要照抄标题：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const callOnce = async (prompt) => {
@@ -420,6 +484,7 @@ async function main() {
     console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
     console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
     console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
+    console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
     const exchangeMap = loadExchangeIdMap();
@@ -427,13 +492,50 @@ async function main() {
     const today = cninfoDateString(0);
     const yesterday = cninfoDateString(-1);
     console.log(`ANN Dates: today=${today} yesterday=${yesterday}`);
-    const merged = await cninfoLatestForTodayAndYesterday();
+    const merged = await cninfoPickDayForTodayAndYesterday();
     const annList = Array.from(merged.values());
     console.log(`ANN Latest unique stocks: ${annList.length}`);
+
     const summaries = await summarizeWithConcurrency(
         annList,
         ANNOUNCEMENT_SUMMARY_CONCURRENCY,
-        async (ann) => llmSummarizeAnnouncement(ann, ANNOUNCEMENT_SUMMARY_CHARS)
+        async (entry) => {
+            const secCode = entry && entry.secCode ? String(entry.secCode) : '';
+            const secName = entry && entry.secName ? String(entry.secName) : '';
+            const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
+            const anns = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+            const titles = anns.map((a) => cleanOneLine(a.title || '')).filter(Boolean);
+            const titleJoined = titles.join('；');
+
+            const payloadTitle = titleJoined || (titles[0] || '');
+            if (!LLM_API_KEY || !pdfParse) {
+                return llmSummarizeAnnouncement(
+                    { secCode, secName, announcementTime, announcementTitle: payloadTitle },
+                    ANNOUNCEMENT_SUMMARY_CHARS,
+                    payloadTitle
+                );
+            }
+
+            const pdfTexts = await summarizeWithConcurrency(
+                anns,
+                ANNOUNCEMENT_PDF_CONCURRENCY,
+                async (a) => fetchAnnouncementPdfText(a)
+            );
+            const bodyBlocks = [];
+            for (let i = 0; i < anns.length; i += 1) {
+                const a = anns[i];
+                const t = cleanOneLine(a && a.title ? a.title : '');
+                const body = cleanOneLine(pdfTexts[i] || '');
+                if (!t && !body) continue;
+                bodyBlocks.push(`【${t}】${body}`);
+            }
+            const payloadText = bodyBlocks.length ? bodyBlocks.join(' ') : payloadTitle;
+            return llmSummarizeAnnouncement(
+                { secCode, secName, announcementTime, announcementTitle: payloadTitle },
+                ANNOUNCEMENT_SUMMARY_CHARS,
+                payloadText
+            );
+        }
     );
     const lines = [];
     let cnt = 0;
@@ -442,7 +544,7 @@ async function main() {
         const stockId = ann && ann.secCode ? String(ann.secCode) : '';
         if (!stockId) continue;
         const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
-        const t = cleanOneLine(ann.announcementTime || '');
+        const t = cleanOneLine(ann.latestTime || '');
         const s = cleanOneLine(summaries[i] || '');
         if (!t || !s) continue;
         lines.push(`${exchangeId}|${stockId}|22|${t} ${s}|0.000`);
