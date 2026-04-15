@@ -410,7 +410,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
     }
     const titleOneLine = cleanOneLine(announcementTitle || '');
     const payload = cleanOneLine(rawText || '') || titleOneLine;
-    const basePrompt = `请将以下公告内容浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行。若同一天多份公告请合并概括。不要照抄标题：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
+    const basePrompt = `请将以下公告正文“通读后”合并输出为一条不超过${maxChars}个汉字的“内容要点”（尽量贴近原文措辞，不要推测/编造）。优先抽取并保留明确的事实信息（事项/金额/数量/比例/对象/时间/业绩数据/增减持数量与期限/会议决议/风险提示等），数字与单位尽量原样保留。只输出内容要点，不要标题，不要换行。若包含多份公告正文（例如多段以【标题】开头），请按时间顺序合并为一段：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const callOnce = async (prompt) => {
@@ -469,7 +469,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         if (titleNorm && firstNorm && (firstNorm === titleNorm || firstNorm.replace(/[。.!！?？]/g, '') === titleNorm.replace(/[。.!！?？]/g, ''))) {
             llmSameAsTitleCnt++;
             llmDebugLog(`ANN LLM retry: sec=${secCode || ''} reason=sameAsTitle titleChars=${titleNorm.length} outChars=${firstNorm.length}`);
-            const retryPrompt = `不要照抄标题。请用一句话解释这条公告在说什么，尽量提到事项与影响（若无法判断可写“标题信息不足，建议查看公告全文”）。只输出摘要，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm}`;
+            const retryPrompt = `不要照抄标题。请尽量从正文提取“内容要点”（贴近原文措辞，保留数字与单位，不要推测/编造），不超过${maxChars}个汉字，只输出一段，不要换行。若正文不足以提取，请输出“正文不足，建议查看公告全文”：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`;
             const second = await callOnce(retryPrompt);
             if (second) return cleanOneLine(second);
         }
