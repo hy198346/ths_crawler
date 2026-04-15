@@ -34,6 +34,9 @@ let llmUsedCnt = 0;
 let llmFallbackCnt = 0;
 let llmSameAsTitleCnt = 0;
 let cninfoFailCnt = 0;
+let llmMissingApiKeyNoted = false;
+let llmPdfParserMissingNoted = false;
+const llmErrorLines = [];
 
 function getTunnelProxyConfig() {
     const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
@@ -93,6 +96,13 @@ function cutByChars(s, maxChars) {
 function llmDebugLog(msg) {
     if (!LLM_DEBUG) return;
     console.log(String(msg || ''));
+}
+
+function addLlmErrorLine(msg) {
+    const one = cleanOneLine(msg || '');
+    if (!one) return;
+    if (llmErrorLines.includes(one)) return;
+    llmErrorLines.push(one);
 }
 
 function cninfoEpochMs(v) {
@@ -404,6 +414,10 @@ async function cninfoPickDayForTodayAndYesterday() {
 async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars, rawText = '') {
     const fallback = cutByChars(announcementTitle || '', maxChars);
     if (!LLM_API_KEY) {
+        if (!llmMissingApiKeyNoted) {
+            llmMissingApiKeyNoted = true;
+            addLlmErrorLine('LLM_API_KEY 缺失，公告摘要已回退为标题/标题拼接。');
+        }
         llmDebugLog(`ANN LLM off: missing apiKey sec=${secCode || ''}`);
         llmFallbackCnt++;
         return fallback;
@@ -460,6 +474,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         llmUsedCnt++;
         const first = await callOnce(basePrompt);
         if (!first) {
+            addLlmErrorLine(`sec=${secCode || ''} LLM 返回空内容，回退标题。`);
             llmDebugLog(`ANN LLM empty: sec=${secCode || ''} fallback=title`);
             llmFallbackCnt++;
             return fallback;
@@ -472,12 +487,17 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             const retryPrompt = `不要照抄标题。请尽量从正文提取“内容要点”（贴近原文措辞，保留数字与单位，不要推测/编造），不超过${maxChars}个汉字，只输出一段，不要换行。若正文不足以提取，请输出“正文不足，建议查看公告全文”：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`;
             const second = await callOnce(retryPrompt);
             if (second) return cleanOneLine(second);
+            addLlmErrorLine(`sec=${secCode || ''} LLM 二次重试后仍为空，回退标题。`);
         }
         return firstNorm;
     } catch (e) {
         llmFailCnt++;
         const sc = e && e.statusCode ? String(e.statusCode) : '';
         console.warn(`LLM summarize failed: ${secCode} status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+        addLlmErrorLine(`sec=${secCode || ''} status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+        if (e && e.body) {
+            addLlmErrorLine(`sec=${secCode || ''} body=${cutByChars(e.body, 260)}`);
+        }
         llmDebugLog(`ANN LLM fail: sec=${secCode || ''} used=${llmUsedCnt} fail=${llmFailCnt} fallback=${llmFallbackCnt}`);
         llmFallbackCnt++;
         return fallback;
@@ -547,6 +567,10 @@ async function main() {
     const merged = await cninfoPickDayForTodayAndYesterday();
     const annList = Array.from(merged.values());
     console.log(`ANN Latest unique stocks: ${annList.length}`);
+    if (LLM_API_KEY && !pdfParse && !llmPdfParserMissingNoted) {
+        llmPdfParserMissingNoted = true;
+        addLlmErrorLine('pdf-parse 不可用，LLM 输入将退化为标题文本，无法通读公告正文。');
+    }
 
     const summaries = await summarizeWithConcurrency(
         annList,
@@ -605,6 +629,16 @@ async function main() {
     }
     fs.writeFileSync(ANN_OUTPUT_PATH, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
     console.log(`公告家数: ${cnt}`);
+    const llmAbnormal = !LLM_API_KEY || llmFailCnt > 0 || llmErrorLines.length > 0 || (annList.length > 0 && llmUsedCnt === 0);
+    if (llmAbnormal) {
+        console.warn(`ANN LLM ALERT: used=${llmUsedCnt} fail=${llmFailCnt} fallback=${llmFallbackCnt} sameAsTitle=${llmSameAsTitleCnt}`);
+        for (const one of llmErrorLines.slice(0, 12)) {
+            console.warn(`ANN LLM ERROR: ${one}`);
+        }
+        if (llmErrorLines.length > 12) {
+            console.warn(`ANN LLM ERROR: 其余 ${llmErrorLines.length - 12} 条已省略`);
+        }
+    }
     console.log(`ANN Done: written=${cnt} cninfoFail=${cninfoFailCnt} llmUsed=${llmUsedCnt} llmSameAsTitle=${llmSameAsTitleCnt} llmFallback=${llmFallbackCnt} llmFail=${llmFailCnt}`);
 }
 

@@ -64,6 +64,20 @@ function getAnnouncementSummaryForNotice() {
   }
 }
 
+function getLlmAlertSummaryForNotice(stdout, stderr) {
+  const text = `${String(stdout || '')}\n${String(stderr || '')}`;
+  const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const alerts = lines.filter((line) => line.includes('ANN LLM ALERT:'));
+  const errors = lines.filter((line) => line.includes('ANN LLM ERROR:'));
+  if (alerts.length === 0 && errors.length === 0) return '';
+  const out = [];
+  out.push('### ⚠️ 大模型告警');
+  for (const a of alerts.slice(0, 3)) out.push(`- ${a}`);
+  for (const e of errors.slice(0, 8)) out.push(`- ${e}`);
+  if (errors.length > 8) out.push(`- 其余 ${errors.length - 8} 条错误已省略（详见任务日志）`);
+  return out.join('\n');
+}
+
 // 发送消息到Server酱的函数
 function sendServerChan(message) {
   if (!SERVERCHAN_KEY) {
@@ -159,6 +173,7 @@ function runCrawler() {
         const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
         const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
         const annSummary = getAnnouncementSummaryForNotice();
+        const llmAlertSummary = getLlmAlertSummaryForNotice(stdout, stderr);
         const successMessage = [
           `### ✅ 爬虫任务成功执行`,
           `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -169,6 +184,7 @@ function runCrawler() {
           `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`,
           `**输出摘要**: ${stdout.trim().slice(-100)}`,
+          llmAlertSummary,
           annSummary
         ].join('\n\n');
         
