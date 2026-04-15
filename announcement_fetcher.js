@@ -32,6 +32,8 @@ const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || '
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
+const ANN_TIME_FORMAT = String(process.env.ANN_TIME_FORMAT || '').trim().toLowerCase();
+const ANN_DECIMAL_DIGITS = Number(process.env.ANN_DECIMAL_DIGITS || 2);
 const ANN_OUTPUT_PATH = process.env.ANN_OUTPUT_PATH || path.join(__dirname, 'extern_user_ann.txt');
 const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'stock_list.json');
 
@@ -105,6 +107,45 @@ function cutByChars(s, maxChars) {
 function llmDebugLog(msg) {
     if (!LLM_DEBUG) return;
     console.log(String(msg || ''));
+}
+
+function formatAnnTime(timeStr) {
+    const s = String(timeStr || '').trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+    if (!m) return s;
+    const mm = m[2];
+    const dd = m[3];
+    const hh = m[4];
+    const mi = m[5];
+    const ss = m[6] || '00';
+    const mode = ANN_TIME_FORMAT === 'mmdd' || ANN_TIME_FORMAT === 'mm-dd' || ANN_TIME_FORMAT === 'date' || ANN_TIME_FORMAT === 'mmdd2'
+        ? 'mmdd'
+        : (ANN_TIME_FORMAT === 'hhmm' || ANN_TIME_FORMAT === 'hh:ss' || ANN_TIME_FORMAT === 'hhss' || ANN_TIME_FORMAT === 'time'
+            ? 'hhmm'
+            : (ANN_TIME_FORMAT === 'hhmmss' ? 'hhmmss' : 'full'));
+    if (mode === 'mmdd') return `${mm}${dd}`;
+    if (mode === 'hhmm') return `${hh}${mi}`;
+    if (mode === 'hhmmss') return `${hh}${mi}${ss}`;
+    return s;
+}
+
+function formatDecimalsInText(text) {
+    const digits = Number.isFinite(ANN_DECIMAL_DIGITS) && ANN_DECIMAL_DIGITS >= 0 ? Math.floor(ANN_DECIMAL_DIGITS) : 2;
+    const t = String(text || '');
+    const reComma = /(?<![\d,])(\d{1,3}(?:,\d{3})+\.\d+)(?![\d,])/g;
+    const rePlain = /(?<!\d)(\d+\.\d+)(?!\d)/g;
+    const fmtComma = new Intl.NumberFormat('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    const fmtPlain = (n) => Number(n).toFixed(digits);
+    const step1 = t.replace(reComma, (m0) => {
+        const n = Number(String(m0).replace(/,/g, ''));
+        if (!Number.isFinite(n)) return m0;
+        return fmtComma.format(n);
+    });
+    return step1.replace(rePlain, (m0) => {
+        const n = Number(m0);
+        if (!Number.isFinite(n)) return m0;
+        return fmtPlain(n);
+    });
 }
 
 function addLlmErrorLine(msg) {
@@ -570,6 +611,7 @@ async function main() {
     console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
     console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
     console.log(`ANN CNINFO plates: ${CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES.join(',') : 'sz'}`);
+    console.log(`ANN Output: timeFormat=${ANN_TIME_FORMAT || 'full'} decimals=${Number.isFinite(ANN_DECIMAL_DIGITS) ? Math.floor(ANN_DECIMAL_DIGITS) : 2}`);
     console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
     console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} maxPerStockRange=${ANNOUNCEMENT_MAX_PER_STOCK_RANGE} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
     const proxy = getTunnelProxyConfig();
@@ -636,8 +678,8 @@ async function main() {
         const stockId = ann && ann.secCode ? String(ann.secCode) : '';
         if (!stockId) continue;
         const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
-        const t = cleanOneLine(ann.latestTime || '');
-        const s = cleanOneLine(summaries[i] || '');
+        const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
+        const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
         if (!t || !s) continue;
         lines.push(`${exchangeId}|${stockId}|22|${t} ${s}|0.000`);
         cnt++;

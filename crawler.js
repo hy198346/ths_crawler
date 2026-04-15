@@ -325,6 +325,8 @@ const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || '
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
+const ANN_TIME_FORMAT = String(process.env.ANN_TIME_FORMAT || '').trim().toLowerCase();
+const ANN_DECIMAL_DIGITS = Number(process.env.ANN_DECIMAL_DIGITS || 2);
 
 // Agent 缓存，用于连接复用与并发优化
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 2000 });
@@ -880,6 +882,45 @@ function cutByChars(s, maxChars) {
     return t.length > n ? t.slice(0, n) : t;
 }
 
+function formatAnnTime(timeStr) {
+    const s = String(timeStr || '').trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+    if (!m) return s;
+    const mm = m[2];
+    const dd = m[3];
+    const hh = m[4];
+    const mi = m[5];
+    const ss = m[6] || '00';
+    const mode = ANN_TIME_FORMAT === 'mmdd' || ANN_TIME_FORMAT === 'mm-dd' || ANN_TIME_FORMAT === 'date'
+        ? 'mmdd'
+        : (ANN_TIME_FORMAT === 'hhmm' || ANN_TIME_FORMAT === 'hhss' || ANN_TIME_FORMAT === 'time'
+            ? 'hhmm'
+            : (ANN_TIME_FORMAT === 'hhmmss' ? 'hhmmss' : 'full'));
+    if (mode === 'mmdd') return `${mm}${dd}`;
+    if (mode === 'hhmm') return `${hh}${mi}`;
+    if (mode === 'hhmmss') return `${hh}${mi}${ss}`;
+    return s;
+}
+
+function formatDecimalsInText(text) {
+    const digits = Number.isFinite(ANN_DECIMAL_DIGITS) && ANN_DECIMAL_DIGITS >= 0 ? Math.floor(ANN_DECIMAL_DIGITS) : 2;
+    const t = String(text || '');
+    const reComma = /(?<![\d,])(\d{1,3}(?:,\d{3})+\.\d+)(?![\d,])/g;
+    const rePlain = /(?<!\d)(\d+\.\d+)(?!\d)/g;
+    const fmtComma = new Intl.NumberFormat('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    const fmtPlain = (n) => Number(n).toFixed(digits);
+    const step1 = t.replace(reComma, (m0) => {
+        const n = Number(String(m0).replace(/,/g, ''));
+        if (!Number.isFinite(n)) return m0;
+        return fmtComma.format(n);
+    });
+    return step1.replace(rePlain, (m0) => {
+        const n = Number(m0);
+        if (!Number.isFinite(n)) return m0;
+        return fmtPlain(n);
+    });
+}
+
 function llmDebugLog(msg) {
     if (!LLM_DEBUG) return;
     console.log(String(msg || ''));
@@ -929,7 +970,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             llmDebugLog(`CRAWLER LLM resHead: ${cutByChars(text, 220)}`);
         }
         const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
-        const s = cutByChars(content || '', maxChars);
+        const s = formatDecimalsInText(cutByChars(content || '', maxChars));
         llmDebugLog(`CRAWLER LLM out: sec=${secCode || ''} outChars=${s.length} fallback=${s ? 'no' : 'yes'}`);
         return s || fallback;
     } catch (e) {
@@ -1041,8 +1082,8 @@ async function main() {
                     const stockId = ann && ann.secCode ? String(ann.secCode) : '';
                     const prefix = stockPrefixMap.get(stockId);
                     if (!prefix) continue;
-                    const timeStr = cleanOneLine(ann.announcementTime || '');
-                    const summaryStr = cleanOneLine(summaries[i] || '');
+                    const timeStr = formatAnnTime(cleanOneLine(ann.announcementTime || ''));
+                    const summaryStr = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
                     if (!timeStr || !summaryStr) continue;
                     stockData.announcement += `${prefix}|22|${timeStr} ${summaryStr}|0.000\n`;
                     stockData.announcementCnt++;
