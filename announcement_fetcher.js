@@ -6,6 +6,7 @@ const zlib = require('zlib');
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
 const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 400);
 const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
+const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
@@ -19,6 +20,9 @@ let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;
 let loggedProxy = false;
 let llmFailCnt = 0;
+let llmUsedCnt = 0;
+let llmFallbackCnt = 0;
+let llmSameAsTitleCnt = 0;
 let cninfoFailCnt = 0;
 
 function getTunnelProxyConfig() {
@@ -238,6 +242,8 @@ async function cninfoDailyLatestByStock(dateStr) {
     const out = new Map();
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
     const pageSize = Number.isFinite(CNINFO_PAGE_SIZE) && CNINFO_PAGE_SIZE > 0 ? CNINFO_PAGE_SIZE : 50;
+    const stallLimit = Number.isFinite(CNINFO_STALL_PAGES) && CNINFO_STALL_PAGES > 0 ? Math.floor(CNINFO_STALL_PAGES) : 0;
+    let stallCount = 0;
 
     for (let page = 1; page <= maxPages; page += 1) {
         let j;
@@ -255,11 +261,13 @@ async function cninfoDailyLatestByStock(dateStr) {
             break;
         }
         console.log(`ANN CNINFO items: date=${dateStr} page=${page} items=${items.length}`);
+        let added = 0;
         for (const item of items) {
             const secCode = String(item.secCode || item.sec_code || '').trim();
             if (!secCode) continue;
             if (seen.has(secCode)) continue;
             seen.add(secCode);
+            added++;
             out.set(secCode, {
                 secCode,
                 secName: String(item.secName || item.sec_name || '').trim(),
@@ -269,6 +277,15 @@ async function cninfoDailyLatestByStock(dateStr) {
             });
         }
         console.log(`ANN CNINFO unique: date=${dateStr} uniqueStocks=${seen.size}`);
+        if (added === 0) {
+            stallCount++;
+        } else {
+            stallCount = 0;
+        }
+        if (stallLimit && stallCount >= stallLimit) {
+            console.log(`ANN CNINFO stop on stall: date=${dateStr} stallPages=${stallCount}`);
+            break;
+        }
     }
     return out;
 }
@@ -290,41 +307,63 @@ async function cninfoLatestForTodayAndYesterday() {
 
 async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars) {
     const fallback = cutByChars(announcementTitle || '', maxChars);
-    if (!LLM_API_KEY) return fallback;
-    const prompt = `请将以下公告信息浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${announcementTitle}`;
+    if (!LLM_API_KEY) {
+        llmFallbackCnt++;
+        return fallback;
+    }
+    const titleOneLine = cleanOneLine(announcementTitle || '');
+    const basePrompt = `请将以下公告信息浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行。若信息不足请给出合理解读但不要照抄标题：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
-        const body = JSON.stringify({
-            model: LLM_MODEL,
-            messages: [
-                { role: 'system', content: '你是严谨的中文财报/公告摘要助手。' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0.2
-        });
-        const res = await requestBuffer(new URL(url), {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${LLM_API_KEY}`,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body)
-            },
-            body,
-            timeoutMs: Math.max(CNINFO_TIMEOUT_MS, 20000)
-        });
-        const text = res.buf.toString();
-        let j;
-        try {
-            j = JSON.parse(text);
-        } catch {
-            j = null;
+        const callOnce = async (prompt) => {
+            const body = JSON.stringify({
+                model: LLM_MODEL,
+                messages: [
+                    { role: 'system', content: '你是严谨的中文财报/公告摘要助手。' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.2
+            });
+            const res = await requestBuffer(new URL(url), {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${LLM_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body)
+                },
+                body,
+                timeoutMs: Math.max(CNINFO_TIMEOUT_MS, 20000)
+            });
+            const text = res.buf.toString();
+            let j;
+            try {
+                j = JSON.parse(text);
+            } catch {
+                j = null;
+            }
+            const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
+            return cutByChars(content || '', maxChars);
+        };
+
+        llmUsedCnt++;
+        const first = await callOnce(basePrompt);
+        if (!first) {
+            llmFallbackCnt++;
+            return fallback;
         }
-        const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
-        const s = cutByChars(content || '', maxChars);
-        return s || fallback;
+        const firstNorm = cleanOneLine(first);
+        const titleNorm = titleOneLine;
+        if (titleNorm && firstNorm && (firstNorm === titleNorm || firstNorm.replace(/[。.!！?？]/g, '') === titleNorm.replace(/[。.!！?？]/g, ''))) {
+            llmSameAsTitleCnt++;
+            const retryPrompt = `不要照抄标题。请用一句话解释这条公告在说什么，尽量提到事项与影响（若无法判断可写“标题信息不足，建议查看公告全文”）。只输出摘要，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm}`;
+            const second = await callOnce(retryPrompt);
+            if (second) return cleanOneLine(second);
+        }
+        return firstNorm;
     } catch (e) {
         llmFailCnt++;
         console.warn(`LLM summarize failed: ${secCode} err=${e && e.message ? e.message : e}`);
+        llmFallbackCnt++;
         return fallback;
     }
 }
@@ -379,7 +418,7 @@ function fallbackExchangeId(stockId) {
 
 async function main() {
     console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
-    console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
+    console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
     console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
@@ -411,7 +450,7 @@ async function main() {
     }
     fs.writeFileSync(ANN_OUTPUT_PATH, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
     console.log(`公告家数: ${cnt}`);
-    console.log(`ANN Done: written=${cnt} cninfoFail=${cninfoFailCnt} llmFail=${llmFailCnt}`);
+    console.log(`ANN Done: written=${cnt} cninfoFail=${cninfoFailCnt} llmUsed=${llmUsedCnt} llmSameAsTitle=${llmSameAsTitleCnt} llmFallback=${llmFallbackCnt} llmFail=${llmFailCnt}`);
 }
 
 main().catch((e) => {
