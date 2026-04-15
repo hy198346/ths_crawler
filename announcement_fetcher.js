@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const tunnel = require('tunnel');
+const zlib = require('zlib');
 
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
 const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 400);
@@ -146,14 +147,26 @@ function requestBuffer(targetUrl, { method = 'GET', headers = {}, body = null, t
                 const chunks = [];
                 res.on('data', (chunk) => chunks.push(chunk));
                 res.on('end', () => {
-                    const buf = Buffer.concat(chunks);
+                    let buf = Buffer.concat(chunks);
+                    const encRaw = res.headers && res.headers['content-encoding'] ? String(res.headers['content-encoding']) : '';
+                    const enc = encRaw.toLowerCase();
+                    try {
+                        if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
+                        else if (enc.includes('br') && typeof zlib.brotliDecompressSync === 'function') buf = zlib.brotliDecompressSync(buf);
+                        else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
+                    } catch (e) {
+                        const err = new Error(`Decompress failed: ${encRaw || 'unknown'}`);
+                        err.statusCode = res.statusCode;
+                        err.inner = e && e.message ? e.message : e;
+                        return reject(err);
+                    }
                     if (res.statusCode !== 200) {
                         const err = new Error(`Status code: ${res.statusCode}`);
                         err.statusCode = res.statusCode;
                         err.body = buf.toString();
                         return reject(err);
                     }
-                    resolve(buf);
+                    resolve({ buf, headers: res.headers || {} });
                 });
             }
         );
@@ -172,6 +185,7 @@ async function cninfoQuery({ seDate, pageNum, pageSize }) {
     const headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Accept-Encoding': 'identity',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Origin': 'https://www.cninfo.com.cn',
         'Referer': 'https://www.cninfo.com.cn/',
@@ -194,13 +208,13 @@ async function cninfoQuery({ seDate, pageNum, pageSize }) {
         isHLtitle: 'true'
     });
     const body = data.toString();
-    const buf = await requestBuffer(new URL(url), {
+    const res = await requestBuffer(new URL(url), {
         method: 'POST',
         headers: { ...headers, 'Content-Length': Buffer.byteLength(body) },
         body,
         timeoutMs: CNINFO_TIMEOUT_MS
     });
-    const text = buf.toString();
+    const text = res.buf.toString();
     let j;
     try {
         j = JSON.parse(text);
@@ -209,7 +223,10 @@ async function cninfoQuery({ seDate, pageNum, pageSize }) {
     }
     if (!j || typeof j !== 'object') {
         const err = new Error('CNINFO invalid JSON');
-        err.body = text;
+        err.body = text.slice(0, 800);
+        const ct = res.headers && res.headers['content-type'] ? String(res.headers['content-type']) : '';
+        const ce = res.headers && res.headers['content-encoding'] ? String(res.headers['content-encoding']) : '';
+        err.meta = `content-type=${ct} content-encoding=${ce}`;
         throw err;
     }
     return j;
@@ -285,7 +302,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             ],
             temperature: 0.2
         });
-        const buf = await requestBuffer(new URL(url), {
+        const res = await requestBuffer(new URL(url), {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${LLM_API_KEY}`,
@@ -295,7 +312,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             body,
             timeoutMs: Math.max(CNINFO_TIMEOUT_MS, 20000)
         });
-        const text = buf.toString();
+        const text = res.buf.toString();
         let j;
         try {
             j = JSON.parse(text);
