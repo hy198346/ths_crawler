@@ -309,6 +309,15 @@ const STOCK_INVESTIGATE_REGEX = /立案调查/;
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
 const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 400);
 const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
+const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'sz,sh')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+const CNINFO_QUERIES = (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : ['sz']).map((plate) => {
+    const p = String(plate || '').trim();
+    const column = p === 'sh' ? 'sse' : 'szse';
+    return { plate: p, column };
+});
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
@@ -754,7 +763,7 @@ function requestBuffer(targetUrl, { method = 'GET', headers = {}, body = null, t
     });
 }
 
-async function cninfoQuery({ seDate, pageNum, pageSize }) {
+async function cninfoQuery({ seDate, pageNum, pageSize, column, plate }) {
     const url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query';
     const headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -767,9 +776,9 @@ async function cninfoQuery({ seDate, pageNum, pageSize }) {
     const data = new URLSearchParams({
         pageNum: String(pageNum),
         pageSize: String(pageSize),
-        column: 'szse',
+        column: String(column || ''),
         tabName: 'fulltext',
-        plate: '',
+        plate: String(plate || ''),
         stock: '',
         searchkey: '',
         secid: '',
@@ -809,32 +818,37 @@ async function cninfoDailyLatestByStock(dateStr, stockIdSet) {
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
     const pageSize = Number.isFinite(CNINFO_PAGE_SIZE) && CNINFO_PAGE_SIZE > 0 ? CNINFO_PAGE_SIZE : 50;
     const targetSize = stockIdSet && stockIdSet.size > 0 ? stockIdSet.size : 0;
+    const queries = Array.isArray(CNINFO_QUERIES) && CNINFO_QUERIES.length ? CNINFO_QUERIES : [{ plate: 'sz', column: 'szse' }];
 
-    for (let page = 1; page <= maxPages; page += 1) {
-        let j;
-        try {
-            j = await cninfoQuery({ seDate, pageNum: page, pageSize });
-        } catch (e) {
-            console.warn(`CNINFO daily query failed: ${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
-            break;
-        }
-        const items = j && Array.isArray(j.announcements) ? j.announcements : null;
-        if (!items || items.length === 0) break;
-        for (const item of items) {
-            const secCode = String(item.secCode || item.sec_code || '').trim();
-            if (!secCode) continue;
-            if (stockIdSet && stockIdSet.size > 0 && !stockIdSet.has(secCode)) continue;
-            if (seen.has(secCode)) continue;
-            seen.add(secCode);
-            out.set(secCode, {
-                secCode,
-                secName: String(item.secName || item.sec_name || '').trim(),
-                announcementTimeRaw: item.announcementTime || item.announcement_time || '',
-                announcementTime: formatCninfoTime(item.announcementTime || item.announcement_time || ''),
-                announcementEpochMs: cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0,
-                announcementTitle: String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
-            });
-            if (targetSize && seen.size >= targetSize) return out;
+    for (const q of queries) {
+        const plate = q && q.plate ? String(q.plate) : '';
+        const column = q && q.column ? String(q.column) : 'szse';
+        for (let page = 1; page <= maxPages; page += 1) {
+            let j;
+            try {
+                j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate });
+            } catch (e) {
+                console.warn(`CNINFO daily query failed: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
+                break;
+            }
+            const items = j && Array.isArray(j.announcements) ? j.announcements : null;
+            if (!items || items.length === 0) break;
+            for (const item of items) {
+                const secCode = String(item.secCode || item.sec_code || '').trim();
+                if (!secCode) continue;
+                if (stockIdSet && stockIdSet.size > 0 && !stockIdSet.has(secCode)) continue;
+                if (seen.has(secCode)) continue;
+                seen.add(secCode);
+                out.set(secCode, {
+                    secCode,
+                    secName: String(item.secName || item.sec_name || '').trim(),
+                    announcementTimeRaw: item.announcementTime || item.announcement_time || '',
+                    announcementTime: formatCninfoTime(item.announcementTime || item.announcement_time || ''),
+                    announcementEpochMs: cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0,
+                    announcementTitle: String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
+                });
+                if (targetSize && seen.size >= targetSize) return out;
+            }
         }
     }
     return out;
