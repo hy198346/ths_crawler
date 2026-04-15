@@ -2,6 +2,7 @@ const { exec } = require('child_process');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const tunnel = require('tunnel');
 
 // 配置参数
 const MAX_RETRIES = 5;         // 最大重试次数
@@ -9,8 +10,100 @@ const RETRY_INTERVAL = 120000;   // 重试间隔(毫秒)
 const EXEC_TIMEOUT = 1800000;   // 执行超时时间(30分钟)
 const SUCCESS_FLAG = 'created'; // 成功标识
 const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
+const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
+const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
+const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
+const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 
 let retryCount = 0;
+
+let tunnelHttpsAgent = null;
+
+function cleanOneLine(s) {
+  return String(s || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function cutByChars(s, maxChars) {
+  const t = cleanOneLine(s);
+  const n = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : 0;
+  if (!n) return t;
+  return t.length > n ? t.slice(0, n) : t;
+}
+
+function llmDebugLog(msg) {
+  if (!LLM_DEBUG) return;
+  console.log(String(msg || ''));
+}
+
+function getTunnelProxyConfig() {
+  const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
+  const username = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
+  const password = process.env.TUNNEL_PASSWORD ? String(process.env.TUNNEL_PASSWORD) : '';
+  if (!tunnelStr || !username || !password) return null;
+  const [host, portStr] = tunnelStr.split(':');
+  const port = Number(portStr);
+  if (!host || !Number.isFinite(port) || port <= 0) return null;
+  return { host, port, proxyAuth: `${username}:${password}` };
+}
+
+function getHttpsAgentForUrl(targetUrl) {
+  const proxy = getTunnelProxyConfig();
+  if (!proxy) return undefined;
+  if (targetUrl.protocol !== 'https:') return undefined;
+  if (!tunnelHttpsAgent) {
+    tunnelHttpsAgent = tunnel.httpsOverHttp({ proxy, maxSockets: 50 });
+  }
+  return tunnelHttpsAgent;
+}
+
+function requestJson(targetUrl, { method = 'GET', headers = {}, body = null, timeoutMs = 20000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || 443,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method,
+        headers,
+        agent: getHttpsAgentForUrl(targetUrl),
+        timeout: timeoutMs
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
+          if (res.statusCode !== 200) {
+            const err = new Error(`Status code: ${res.statusCode}`);
+            err.statusCode = res.statusCode;
+            err.body = buf.toString();
+            return reject(err);
+          }
+          const text = buf.toString();
+          let j;
+          try {
+            j = JSON.parse(text);
+          } catch {
+            j = null;
+          }
+          if (!j || typeof j !== 'object') {
+            const err = new Error('Invalid JSON');
+            err.body = text.slice(0, 800);
+            return reject(err);
+          }
+          resolve(j);
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+    if (body) req.write(body);
+    req.end();
+  });
+}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return '未知';
@@ -60,6 +153,99 @@ function getAnnouncementSummaryForNotice() {
     const more = lines.length > out.length ? `\n\n...(${lines.length - out.length} 条未展示)` : '';
     return `### 📌 公告摘要（type 22）\n\n${out.join('\n')}${more}`;
   } catch (e) {
+    return '';
+  }
+}
+
+function parseAnnouncementFileForLlm() {
+  const annPath = path.resolve(__dirname, 'extern_user_ann.txt');
+  const raw = fs.readFileSync(annPath, 'utf8');
+  const lines = raw.split(/\r?\n/).filter(Boolean);
+  const items = [];
+  for (const line of lines) {
+    const parts = line.split('|');
+    if (parts.length < 5) continue;
+    const stockId = String(parts[1] || '').trim();
+    const text = cleanOneLine(parts[3] || '');
+    if (!stockId || !text) continue;
+    items.push({ stockId, text });
+  }
+  return { count: items.length, items };
+}
+
+async function getAnnouncementDigestByKimi() {
+  if (!LLM_API_KEY) return '';
+  let parsed;
+  try {
+    parsed = parseAnnouncementFileForLlm();
+  } catch {
+    return '';
+  }
+  if (!parsed || !parsed.count) return '';
+
+  const topN = Number(process.env.ANNOUNCE_KIMI_TOP_N || 10);
+  const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
+  const maxInChars = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_CHARS || 120000);
+  const safeTopN = Number.isFinite(topN) && topN > 0 ? Math.floor(topN) : 10;
+  const safeMaxLines = Number.isFinite(maxInLines) && maxInLines > 0 ? Math.floor(maxInLines) : 800;
+  const safeMaxChars = Number.isFinite(maxInChars) && maxInChars > 2000 ? Math.floor(maxInChars) : 120000;
+
+  const picked = [];
+  let used = 0;
+  for (const it of parsed.items) {
+    if (picked.length >= safeMaxLines) break;
+    const one = `${it.stockId} ${it.text}`;
+    used += one.length + 1;
+    if (used > safeMaxChars) break;
+    picked.push(one);
+  }
+
+  const prompt = [
+    `你是财经快讯编辑。请从下列公告中精选最重要的${safeTopN}条，输出用于短信/邮件的“公告要闻”。`,
+    '要求：',
+    `- 只输出${safeTopN}条（不足则全输出），按重要性降序`,
+    '- 每条一行，用“- 代码 要点”格式',
+    '- 要点要像财经网站标题一样精炼（尽量<=40个汉字），信息密度高，只写事实不推测/不编造，数字和单位尽量原样保留',
+    '- 不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）',
+    '- 多篇公告：优先挑选业绩/财报/分红/业绩预告等，其次重大资产/增减持/回购/监管/诉讼/重大合同/股权变动等',
+    '',
+    `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
+    ...picked
+  ].join('\n');
+
+  const url = `${LLM_BASE_URL}/chat/completions`;
+  const t0 = Date.now();
+  const body = JSON.stringify({
+    model: LLM_MODEL,
+    messages: [
+      { role: 'system', content: '你是严谨的中文财经快讯编辑。' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.2
+  });
+  try {
+    llmDebugLog(`MAIL LLM req: model=${LLM_MODEL} host=${new URL(url).host} promptChars=${prompt.length} bodyBytes=${Buffer.byteLength(body)}`);
+    const j = await requestJson(new URL(url), {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LLM_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Accept-Encoding': 'identity'
+      },
+      body,
+      timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
+    });
+    llmDebugLog(`MAIL LLM res: ms=${Date.now() - t0} json=ok`);
+    const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
+    const out = cleanOneLine(content || '');
+    const normalized = out.split(/\\n/).map((s) => s.trim()).filter(Boolean).join('\n');
+    if (!normalized) return '';
+    return `### 📌 公告要闻（Kimi精选）\n\n${normalized}\n\n（共${parsed.count}条公告）`;
+  } catch (e) {
+    const sc = e && e.statusCode ? String(e.statusCode) : '';
+    console.warn(`MAIL LLM digest failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+    if (e && e.body) console.warn(`MAIL LLM digest body: ${cutByChars(e.body, 300)}`);
     return '';
   }
 }
@@ -165,30 +351,33 @@ function runCrawler() {
       // 成功时退出
       if (successDetected) {
         console.log(`${logPrefix} 爬取成功！`);
-        
-        // 发送Server酱通知
-        const externUserSize = getExternUserFileSizeForNotice();
-        const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
-        const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
-        const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
-        const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
-        const annSummary = getAnnouncementSummaryForNotice();
-        const llmAlertSummary = getLlmAlertSummaryForNotice(stdout, stderr);
-        const successMessage = [
-          `### ✅ 爬虫任务成功执行`,
-          `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
-          `**开始时间**: ${startTime.toLocaleString()}`,
-          `**结束时间**: ${endTime.toLocaleString()}`,
-          `**执行耗时**: ${elapsed}秒`,
-          `**股票总数**: ${totalStockCount}`,
-          `**输出行数**: ${lineCount}`,
-          `**extern_user.txt 大小**: ${externUserSize}`,
-          `**输出摘要**: ${stdout.trim().slice(-100)}`,
-          llmAlertSummary,
-          annSummary
-        ].join('\n\n');
-        
-        sendServerChan(successMessage).finally(() => process.exit(0));
+        (async () => {
+          const externUserSize = getExternUserFileSizeForNotice();
+          const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
+          const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
+          const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
+          const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
+          const llmAlertSummary = getLlmAlertSummaryForNotice(stdout, stderr);
+          const kimiDigest = await getAnnouncementDigestByKimi();
+          const annSummary = kimiDigest || getAnnouncementSummaryForNotice();
+          const successMessage = [
+            `### ✅ 爬虫任务成功执行`,
+            `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
+            `**开始时间**: ${startTime.toLocaleString()}`,
+            `**结束时间**: ${endTime.toLocaleString()}`,
+            `**执行耗时**: ${elapsed}秒`,
+            `**股票总数**: ${totalStockCount}`,
+            `**输出行数**: ${lineCount}`,
+            `**extern_user.txt 大小**: ${externUserSize}`,
+            `**输出摘要**: ${stdout.trim().slice(-100)}`,
+            llmAlertSummary,
+            annSummary
+          ].filter(Boolean).join('\n\n');
+          sendServerChan(successMessage).finally(() => process.exit(0));
+        })().catch((e) => {
+          console.error('Build notice failed:', e && e.message ? e.message : e);
+          sendServerChan(`### ✅ 爬虫任务成功执行\n\n但构建通知失败：${e && e.message ? e.message : e}`).finally(() => process.exit(0));
+        });
         return;
       }
 
