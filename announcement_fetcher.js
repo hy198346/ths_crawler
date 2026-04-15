@@ -16,6 +16,9 @@ const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'sto
 
 let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;
+let loggedProxy = false;
+let llmFailCnt = 0;
+let cninfoFailCnt = 0;
 
 function getTunnelProxyConfig() {
     const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
@@ -31,6 +34,10 @@ function getTunnelProxyConfig() {
 function getAgentForUrl(targetUrl) {
     const proxy = getTunnelProxyConfig();
     if (!proxy) return undefined;
+    if (!loggedProxy) {
+        loggedProxy = true;
+        console.log(`ANN Proxy enabled: ${proxy.host}:${proxy.port}`);
+    }
     if (targetUrl.protocol === 'https:') {
         if (!tunnelHttpsAgent) {
             tunnelHttpsAgent = tunnel.httpsOverHttp({ proxy, maxSockets: 200 });
@@ -218,13 +225,19 @@ async function cninfoDailyLatestByStock(dateStr) {
     for (let page = 1; page <= maxPages; page += 1) {
         let j;
         try {
+            console.log(`ANN CNINFO query: date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
             j = await cninfoQuery({ seDate, pageNum: page, pageSize });
         } catch (e) {
+            cninfoFailCnt++;
             console.warn(`CNINFO daily query failed: ${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
             break;
         }
         const items = j && Array.isArray(j.announcements) ? j.announcements : null;
-        if (!items || items.length === 0) break;
+        if (!items || items.length === 0) {
+            console.log(`ANN CNINFO empty: date=${dateStr} page=${page}`);
+            break;
+        }
+        console.log(`ANN CNINFO items: date=${dateStr} page=${page} items=${items.length}`);
         for (const item of items) {
             const secCode = String(item.secCode || item.sec_code || '').trim();
             if (!secCode) continue;
@@ -238,6 +251,7 @@ async function cninfoDailyLatestByStock(dateStr) {
                 announcementTitle: String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
             });
         }
+        console.log(`ANN CNINFO unique: date=${dateStr} uniqueStocks=${seen.size}`);
     }
     return out;
 }
@@ -292,6 +306,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         const s = cutByChars(content || '', maxChars);
         return s || fallback;
     } catch (e) {
+        llmFailCnt++;
         console.warn(`LLM summarize failed: ${secCode} err=${e && e.message ? e.message : e}`);
         return fallback;
     }
@@ -346,9 +361,19 @@ function fallbackExchangeId(stockId) {
 }
 
 async function main() {
+    console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
+    console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
+    console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
+    const proxy = getTunnelProxyConfig();
+    console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
     const exchangeMap = loadExchangeIdMap();
+    console.log(`ANN Stock list: path=${STOCK_LIST_PATH} size=${exchangeMap.size}`);
+    const today = cninfoDateString(0);
+    const yesterday = cninfoDateString(-1);
+    console.log(`ANN Dates: today=${today} yesterday=${yesterday}`);
     const merged = await cninfoLatestForTodayAndYesterday();
     const annList = Array.from(merged.values());
+    console.log(`ANN Latest unique stocks: ${annList.length}`);
     const summaries = await summarizeWithConcurrency(
         annList,
         ANNOUNCEMENT_SUMMARY_CONCURRENCY,
@@ -369,6 +394,7 @@ async function main() {
     }
     fs.writeFileSync(ANN_OUTPUT_PATH, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
     console.log(`公告家数: ${cnt}`);
+    console.log(`ANN Done: written=${cnt} cninfoFail=${cninfoFailCnt} llmFail=${llmFailCnt}`);
 }
 
 main().catch((e) => {

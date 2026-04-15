@@ -60,6 +60,7 @@ function stripCreatedLines(text) {
 }
 
 async function main() {
+    console.log(`Runner start: thsTmp=${THS_TMP_PATH} annTmp=${ANN_TMP_PATH} out=${OUT_PATH}`);
     const thsPromise = runNode('crawler.js', {
         STOCK_INFO_FILE_PATH: THS_TMP_PATH,
         ENABLE_ANNOUNCEMENTS: 'false'
@@ -70,6 +71,7 @@ async function main() {
     });
 
     const [ths, ann] = await Promise.all([thsPromise, annPromise]);
+    console.log(`Runner done: thsOk=${ths.ok} thsCode=${ths.code} annOk=${ann.ok} annCode=${ann.code}`);
 
     if (ths.stdout) process.stdout.write(stripCreatedLines(ths.stdout));
     if (ths.stderr) process.stderr.write(ths.stderr);
@@ -96,11 +98,13 @@ async function main() {
 
     const thsBuf = fs.readFileSync(THS_TMP_PATH);
     const thsText = iconv.decode(thsBuf, 'GBK');
+    console.log(`Runner thsTmpBytes: ${thsBuf.length}`);
 
     let annText = '';
     if (fs.existsSync(ANN_TMP_PATH) && ann.ok) {
         annText = fs.readFileSync(ANN_TMP_PATH, 'utf8');
     }
+    console.log(`Runner annTmpChars: ${annText.length}`);
 
     const combined = `${thsText}${annText}`;
     const outBuf = iconv.encode(combined, 'GBK');
@@ -122,4 +126,3 @@ main().catch((e) => {
     console.error(e && e.stack ? e.stack : String(e));
     process.exit(1);
 });
-
