@@ -20,7 +20,7 @@ const CNINFO_QUERIES = (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : 
     const column = p === 'sh' ? 'sse' : 'szse';
     return { plate: p, column };
 });
-const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
+const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 100);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
 const ANNOUNCEMENT_MAX_PER_STOCK_DAY = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_DAY || 10);
 const ANNOUNCEMENT_MAX_PER_STOCK_RANGE = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_RANGE || ANNOUNCEMENT_MAX_PER_STOCK_DAY * 2);
@@ -479,7 +479,17 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
     }
     const titleOneLine = cleanOneLine(announcementTitle || '');
     const payload = cleanOneLine(rawText || '') || titleOneLine;
-    const basePrompt = `请将以下公告正文通读后，改写成一句“财经网站标题风格”的内容要点，不超过${maxChars}个汉字：要求精炼、信息密度高、只写事实不推测/不编造，数字与单位尽量原样保留；不要出现公司名称/简称/股票名称（可用“公司”代替或直接省略主语）；不要输出标题字样/不要换行。若包含多份公告正文（例如多段以【标题】开头），优先提炼业绩/财报/分红等业绩相关信息；若无业绩信息，再提炼最重要的一条事项。输入：股票:${secCode} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
+    const basePrompt = [
+        `你是财经快讯编辑。请将下列公告通读后，产出一条用于短信/邮件的“公告要点”。`,
+        '要求：',
+        `- 不超过${maxChars}个汉字`,
+        '- 要点要像财经网站标题一样精炼（尽量<=40个汉字），信息密度高，只写事实不推测/不编造，数字和单位尽量原样保留',
+        '- 不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）',
+        '- 不要输出标题字样，不要换行',
+        '- 若包含多份公告正文（例如多段以【标题】开头），优先提炼业绩/财报/分红/业绩预告等；若无业绩信息，再提炼最重要的一条事项',
+        '',
+        `输入：股票:${secCode} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`
+    ].join('\n');
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const callOnce = async (prompt) => {
@@ -539,7 +549,17 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         if (titleNorm && firstNorm && (firstNorm === titleNorm || firstNorm.replace(/[。.!！?？]/g, '') === titleNorm.replace(/[。.!！?？]/g, ''))) {
             llmSameAsTitleCnt++;
             llmDebugLog(`ANN LLM retry: sec=${secCode || ''} reason=sameAsTitle titleChars=${titleNorm.length} outChars=${firstNorm.length}`);
-            const retryPrompt = `不要照抄标题。请从正文改写成一句财经快讯标题风格的内容要点（更简洁），不超过${maxChars}个汉字；只写事实不推测/不编造，保留数字与单位；不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语），不要换行。若正文不足以提取，请输出“正文不足，建议查看公告全文”：股票:${secCode} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`;
+            const retryPrompt = [
+                '不要照抄标题。请从正文改写出一条更简洁的公告要点。',
+                '要求：',
+                `- 不超过${maxChars}个汉字`,
+                '- 只写事实不推测/不编造，数字和单位尽量原样保留',
+                '- 不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）',
+                '- 不要换行',
+                '若正文不足以提取，请输出“正文不足，建议查看公告全文”。',
+                '',
+                `输入：股票:${secCode} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`
+            ].join('\n');
             const second = await callOnce(retryPrompt);
             if (second) return cleanOneLine(second);
             addLlmErrorLine(`sec=${secCode || ''} LLM 二次重试后仍为空，回退标题。`);

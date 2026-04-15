@@ -238,8 +238,8 @@ async function getAnnouncementDigestByKimi() {
     });
     llmDebugLog(`MAIL LLM res: ms=${Date.now() - t0} json=ok`);
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
-    const out = cleanOneLine(content || '');
-    const normalized = out.split(/\\n/).map((s) => s.trim()).filter(Boolean).join('\n');
+    const out = String(content || '');
+    const normalized = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).join('\n\n');
     if (!normalized) return '';
     return `### 📌 公告要闻（Kimi精选）\n\n${normalized}\n\n（共${parsed.count}条公告）`;
   } catch (e) {
