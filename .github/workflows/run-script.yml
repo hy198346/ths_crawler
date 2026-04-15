@@ -45,6 +45,8 @@ jobs:
           TUNNEL_USERNAME: ${{ secrets.TUNNEL_USERNAME }}
           TUNNEL_PASSWORD: ${{ secrets.TUNNEL_PASSWORD }}
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          ANNOUNCEMENT_SUMMARY_CHARS: ${{ secrets.ANNOUNCEMENT_SUMMARY_CHARS }}
+          KIMI_DEBUG: ${{ secrets.KIMI_DEBUG }}
         run: |
           echo "当前工作目录: $(pwd)"
           node run.js 
