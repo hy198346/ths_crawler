@@ -314,6 +314,7 @@ const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
+const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
 
 // Agent 缓存，用于连接复用与并发优化
@@ -865,12 +866,21 @@ function cutByChars(s, maxChars) {
     return t.length > n ? t.slice(0, n) : t;
 }
 
+function llmDebugLog(msg) {
+    if (!LLM_DEBUG) return;
+    console.log(String(msg || ''));
+}
+
 async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars) {
     const fallback = cutByChars(announcementTitle || '', maxChars);
-    if (!LLM_API_KEY) return fallback;
+    if (!LLM_API_KEY) {
+        llmDebugLog(`CRAWLER LLM off: missing apiKey sec=${secCode || ''}`);
+        return fallback;
+    }
     const prompt = `请将以下公告信息浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${announcementTitle}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
+        const t0 = Date.now();
         const body = JSON.stringify({
             model: LLM_MODEL,
             messages: [
@@ -879,6 +889,9 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             ],
             temperature: 0.2
         });
+        llmDebugLog(
+            `CRAWLER LLM req: sec=${secCode || ''} model=${LLM_MODEL} host=${new URL(url).host} promptChars=${String(prompt || '').length} bodyBytes=${Buffer.byteLength(body)}`
+        );
         const buf = await requestBuffer(new URL(url), {
             method: 'POST',
             headers: {
@@ -896,11 +909,18 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         } catch {
             j = null;
         }
+        const tookMs = Date.now() - t0;
+        llmDebugLog(`CRAWLER LLM res: sec=${secCode || ''} ms=${tookMs} bytes=${buf.length} json=${j ? 'ok' : 'fail'}`);
+        if (!j) {
+            llmDebugLog(`CRAWLER LLM resHead: ${cutByChars(text, 220)}`);
+        }
         const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
         const s = cutByChars(content || '', maxChars);
+        llmDebugLog(`CRAWLER LLM out: sec=${secCode || ''} outChars=${s.length} fallback=${s ? 'no' : 'yes'}`);
         return s || fallback;
     } catch (e) {
-        console.warn(`LLM summarize failed: ${secCode} err=${e && e.message ? e.message : e}`);
+        const sc = e && e.statusCode ? String(e.statusCode) : '';
+        console.warn(`LLM summarize failed: ${secCode} status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
         return fallback;
     }
 }

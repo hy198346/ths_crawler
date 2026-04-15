@@ -13,13 +13,15 @@ const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
 const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
-const ANNOUNCEMENT_MAX_PER_STOCK_DAY = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_DAY || 3);
+const ANNOUNCEMENT_MAX_PER_STOCK_DAY = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_DAY || 10);
+const ANNOUNCEMENT_MAX_PER_STOCK_RANGE = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_RANGE || ANNOUNCEMENT_MAX_PER_STOCK_DAY * 2);
 const ANNOUNCEMENT_PDF_CONCURRENCY = Number(process.env.ANNOUNCEMENT_PDF_CONCURRENCY || 2);
 const ANNOUNCEMENT_PDF_MAX_CHARS = Number(process.env.ANNOUNCEMENT_PDF_MAX_CHARS || 8000);
 const ANNOUNCEMENT_PDF_MAX_BYTES = Number(process.env.ANNOUNCEMENT_PDF_MAX_BYTES || 8000000);
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
+const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
 const ANN_OUTPUT_PATH = process.env.ANN_OUTPUT_PATH || path.join(__dirname, 'extern_user_ann.txt');
 const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'stock_list.json');
@@ -86,6 +88,11 @@ function cutByChars(s, maxChars) {
     const n = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : 0;
     if (!n) return t;
     return t.length > n ? t.slice(0, n) : t;
+}
+
+function llmDebugLog(msg) {
+    if (!LLM_DEBUG) return;
+    console.log(String(msg || ''));
 }
 
 function cninfoEpochMs(v) {
@@ -363,7 +370,33 @@ async function cninfoPickDayForTodayAndYesterday() {
     const merged = new Map();
     for (const [k, v] of todayMap.entries()) merged.set(k, v);
     for (const [k, v] of yMap.entries()) {
-        if (!merged.has(k)) merged.set(k, v);
+        const cur = merged.get(k);
+        if (!cur) {
+            merged.set(k, v);
+            continue;
+        }
+        const combined = []
+            .concat(Array.isArray(cur.announcements) ? cur.announcements : [])
+            .concat(Array.isArray(v.announcements) ? v.announcements : []);
+        const uniq = [];
+        const seen = new Set();
+        for (const a of combined) {
+            const id = a && a.announcementId ? String(a.announcementId) : '';
+            const key = id ? `id:${id}` : `t:${String(a && a.time ? a.time : '')}|${String(a && a.title ? a.title : '')}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniq.push(a);
+        }
+        uniq.sort((a, b) => (Number(b && b.epochMs ? b.epochMs : 0) || 0) - (Number(a && a.epochMs ? a.epochMs : 0) || 0));
+        const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
+            ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
+            : 0;
+        cur.announcements = cap ? uniq.slice(0, cap) : uniq;
+        if ((v.latestEpochMs || 0) > (cur.latestEpochMs || 0)) {
+            cur.latestEpochMs = v.latestEpochMs || 0;
+            cur.latestTime = v.latestTime || '';
+        }
+        if (!cur.secName && v.secName) cur.secName = v.secName;
     }
     return merged;
 }
@@ -371,6 +404,7 @@ async function cninfoPickDayForTodayAndYesterday() {
 async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars, rawText = '') {
     const fallback = cutByChars(announcementTitle || '', maxChars);
     if (!LLM_API_KEY) {
+        llmDebugLog(`ANN LLM off: missing apiKey sec=${secCode || ''}`);
         llmFallbackCnt++;
         return fallback;
     }
@@ -380,6 +414,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const callOnce = async (prompt) => {
+            const t0 = Date.now();
             const body = JSON.stringify({
                 model: LLM_MODEL,
                 messages: [
@@ -388,6 +423,9 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
                 ],
                 temperature: 0.2
             });
+            llmDebugLog(
+                `ANN LLM req: sec=${secCode || ''} model=${LLM_MODEL} host=${new URL(url).host} promptChars=${String(prompt || '').length} bodyBytes=${Buffer.byteLength(body)}`
+            );
             const res = await requestBuffer(new URL(url), {
                 method: 'POST',
                 headers: {
@@ -405,13 +443,24 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             } catch {
                 j = null;
             }
+            const tookMs = Date.now() - t0;
+            const ct = res.headers && res.headers['content-type'] ? String(res.headers['content-type']) : '';
+            llmDebugLog(
+                `ANN LLM res: sec=${secCode || ''} ms=${tookMs} bytes=${res.buf.length} contentType=${ct || 'unknown'} json=${j ? 'ok' : 'fail'}`
+            );
+            if (!j) {
+                llmDebugLog(`ANN LLM resHead: ${cutByChars(text, 220)}`);
+            }
             const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
-            return cutByChars(content || '', maxChars);
+            const out = cutByChars(content || '', maxChars);
+            llmDebugLog(`ANN LLM out: sec=${secCode || ''} outChars=${out.length} fallback=${out ? 'no' : 'yes'}`);
+            return out;
         };
 
         llmUsedCnt++;
         const first = await callOnce(basePrompt);
         if (!first) {
+            llmDebugLog(`ANN LLM empty: sec=${secCode || ''} fallback=title`);
             llmFallbackCnt++;
             return fallback;
         }
@@ -419,6 +468,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         const titleNorm = titleOneLine;
         if (titleNorm && firstNorm && (firstNorm === titleNorm || firstNorm.replace(/[。.!！?？]/g, '') === titleNorm.replace(/[。.!！?？]/g, ''))) {
             llmSameAsTitleCnt++;
+            llmDebugLog(`ANN LLM retry: sec=${secCode || ''} reason=sameAsTitle titleChars=${titleNorm.length} outChars=${firstNorm.length}`);
             const retryPrompt = `不要照抄标题。请用一句话解释这条公告在说什么，尽量提到事项与影响（若无法判断可写“标题信息不足，建议查看公告全文”）。只输出摘要，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm}`;
             const second = await callOnce(retryPrompt);
             if (second) return cleanOneLine(second);
@@ -426,7 +476,9 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         return firstNorm;
     } catch (e) {
         llmFailCnt++;
-        console.warn(`LLM summarize failed: ${secCode} err=${e && e.message ? e.message : e}`);
+        const sc = e && e.statusCode ? String(e.statusCode) : '';
+        console.warn(`LLM summarize failed: ${secCode} status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+        llmDebugLog(`ANN LLM fail: sec=${secCode || ''} used=${llmUsedCnt} fail=${llmFailCnt} fallback=${llmFallbackCnt}`);
         llmFallbackCnt++;
         return fallback;
     }
@@ -484,7 +536,7 @@ async function main() {
     console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
     console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
     console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
-    console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
+    console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} maxPerStockRange=${ANNOUNCEMENT_MAX_PER_STOCK_RANGE} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
     const exchangeMap = loadExchangeIdMap();
@@ -504,6 +556,7 @@ async function main() {
             const secName = entry && entry.secName ? String(entry.secName) : '';
             const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
             const anns = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+            llmDebugLog(`ANN Summarize: sec=${secCode || ''} anns=${anns.length} pdf=${LLM_API_KEY && pdfParse ? 'on' : 'off'}`);
             const titles = anns.map((a) => cleanOneLine(a.title || '')).filter(Boolean);
             const titleJoined = titles.join('；');
 
