@@ -27,7 +27,7 @@ const ANNOUNCEMENT_MAX_PER_STOCK_RANGE = Number(process.env.ANNOUNCEMENT_MAX_PER
 const ANNOUNCEMENT_PDF_CONCURRENCY = Number(process.env.ANNOUNCEMENT_PDF_CONCURRENCY || 2);
 const ANNOUNCEMENT_PDF_MAX_CHARS = Number(process.env.ANNOUNCEMENT_PDF_MAX_CHARS || 8000);
 const ANNOUNCEMENT_PDF_MAX_BYTES = Number(process.env.ANNOUNCEMENT_PDF_MAX_BYTES || 8000000);
-const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
+const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
@@ -438,7 +438,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
     }
     const titleOneLine = cleanOneLine(announcementTitle || '');
     const payload = cleanOneLine(rawText || '') || titleOneLine;
-    const basePrompt = `请将以下公告正文“通读后”合并输出为一条不超过${maxChars}个汉字的“内容要点”（尽量贴近原文措辞，不要推测/编造）。优先抽取并保留明确的事实信息（事项/金额/数量/比例/对象/时间/业绩数据/增减持数量与期限/会议决议/风险提示等），数字与单位尽量原样保留。只输出内容要点，不要标题，不要换行。若包含多份公告正文（例如多段以【标题】开头），请按时间顺序合并为一段：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
+    const basePrompt = `请将以下公告正文通读后，改写成一句“财经网站标题风格”的内容要点，不超过${maxChars}个汉字：要求精炼、信息密度高、只写事实不推测/不编造，数字与单位尽量原样保留；不要出现公司名称/简称/股票名称（可用“公司”代替或直接省略主语）；不要输出标题字样/不要换行。若包含多份公告正文（例如多段以【标题】开头），优先提炼业绩/财报/分红等业绩相关信息；若无业绩信息，再提炼最重要的一条事项。输入：股票:${secCode} 时间:${announcementTime} 标题:${titleOneLine} 正文:${payload}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const callOnce = async (prompt) => {
@@ -498,7 +498,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         if (titleNorm && firstNorm && (firstNorm === titleNorm || firstNorm.replace(/[。.!！?？]/g, '') === titleNorm.replace(/[。.!！?？]/g, ''))) {
             llmSameAsTitleCnt++;
             llmDebugLog(`ANN LLM retry: sec=${secCode || ''} reason=sameAsTitle titleChars=${titleNorm.length} outChars=${firstNorm.length}`);
-            const retryPrompt = `不要照抄标题。请尽量从正文提取“内容要点”（贴近原文措辞，保留数字与单位，不要推测/编造），不超过${maxChars}个汉字，只输出一段，不要换行。若正文不足以提取，请输出“正文不足，建议查看公告全文”：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`;
+            const retryPrompt = `不要照抄标题。请从正文改写成一句财经快讯标题风格的内容要点（更简洁），不超过${maxChars}个汉字；只写事实不推测/不编造，保留数字与单位；不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语），不要换行。若正文不足以提取，请输出“正文不足，建议查看公告全文”：股票:${secCode} 时间:${announcementTime} 标题:${titleNorm} 正文:${payload}`;
             const second = await callOnce(retryPrompt);
             if (second) return cleanOneLine(second);
             addLlmErrorLine(`sec=${secCode || ''} LLM 二次重试后仍为空，回退标题。`);

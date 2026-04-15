@@ -320,7 +320,7 @@ const CNINFO_QUERIES = (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : 
 });
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 200);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
-const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'moonshot-v1-8k';
+const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
@@ -891,7 +891,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         llmDebugLog(`CRAWLER LLM off: missing apiKey sec=${secCode || ''}`);
         return fallback;
     }
-    const prompt = `请将以下公告信息浓缩为不超过${maxChars}个汉字，保留关键信息（公司/事项/金额/时间/影响）。只输出摘要，不要标题，不要换行：股票:${secCode} 名称:${secName} 时间:${announcementTime} 标题:${announcementTitle}`;
+    const prompt = `请将以下公告信息改写成一句“财经网站标题风格”的内容要点，不超过${maxChars}个汉字：要求精炼、信息密度高、只写事实不推测/不编造，数字与单位尽量原样保留；不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）；不要输出标题字样/不要换行。输入：股票:${secCode} 时间:${announcementTime} 标题:${announcementTitle}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const t0 = Date.now();
