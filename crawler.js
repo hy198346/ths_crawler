@@ -263,7 +263,7 @@ async function getBufferWithTunnelPolicy(targetUrl, headers = {}, timeoutMs, ses
 }
 
 // 配置常量
-const STOCK_INFO_FILE_PATH = crawler_config.config.filePath;
+const STOCK_INFO_FILE_PATH = process.env.STOCK_INFO_FILE_PATH || crawler_config.config.filePath;
 const SLEEP_TIME = crawler_config.config.sleepTime;
 const TASK_COUNT = crawler_config.config.taksCount;
 const TASK_SLEEP_COUNT = crawler_config.config.taskSleepCount;
@@ -299,6 +299,7 @@ const ADAPTIVE_HANGUP_LOW = Number(crawler_config.config.adaptiveHangupLow || 0.
 const ADAPTIVE_ADJUST_COOLDOWN_MS = Number(crawler_config.config.adaptiveAdjustCooldownMs || 15000);
 const ADAPTIVE_SEVERE_NETERR = 0.6;
 const ADAPTIVE_PAUSE_MS = 5000;
+const ENABLE_ANNOUNCEMENTS = process.env.ENABLE_ANNOUNCEMENTS === 'true';
 
 // 正则表达式常量
 const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
@@ -992,28 +993,30 @@ async function main() {
             }
         }
 
-        try {
-            const cninfoLatest = await cninfoLatestForTodayAndYesterday(stockIdSet);
-            const annList = Array.from(cninfoLatest.values());
-            const summaries = await summarizeWithConcurrency(
-                annList,
-                ANNOUNCEMENT_SUMMARY_CONCURRENCY,
-                async (ann) => llmSummarizeAnnouncement(ann, ANNOUNCEMENT_SUMMARY_CHARS)
-            );
-            for (let i = 0; i < annList.length; i += 1) {
-                const ann = annList[i];
-                const stockId = ann && ann.secCode ? String(ann.secCode) : '';
-                const prefix = stockPrefixMap.get(stockId);
-                if (!prefix) continue;
-                const timeStr = cleanOneLine(ann.announcementTime || '');
-                const summaryStr = cleanOneLine(summaries[i] || '');
-                if (!timeStr || !summaryStr) continue;
-                stockData.announcement += `${prefix}|22|${timeStr} ${summaryStr}|0.000\n`;
-                stockData.announcementCnt++;
+        if (ENABLE_ANNOUNCEMENTS) {
+            try {
+                const cninfoLatest = await cninfoLatestForTodayAndYesterday(stockIdSet);
+                const annList = Array.from(cninfoLatest.values());
+                const summaries = await summarizeWithConcurrency(
+                    annList,
+                    ANNOUNCEMENT_SUMMARY_CONCURRENCY,
+                    async (ann) => llmSummarizeAnnouncement(ann, ANNOUNCEMENT_SUMMARY_CHARS)
+                );
+                for (let i = 0; i < annList.length; i += 1) {
+                    const ann = annList[i];
+                    const stockId = ann && ann.secCode ? String(ann.secCode) : '';
+                    const prefix = stockPrefixMap.get(stockId);
+                    if (!prefix) continue;
+                    const timeStr = cleanOneLine(ann.announcementTime || '');
+                    const summaryStr = cleanOneLine(summaries[i] || '');
+                    if (!timeStr || !summaryStr) continue;
+                    stockData.announcement += `${prefix}|22|${timeStr} ${summaryStr}|0.000\n`;
+                    stockData.announcementCnt++;
+                }
+                console.log(`公告家数: ${stockData.announcementCnt}`);
+            } catch (e) {
+                console.warn(`公告抓取失败: ${e && e.message ? e.message : e}`);
             }
-            console.log(`公告家数: ${stockData.announcementCnt}`);
-        } catch (e) {
-            console.warn(`公告抓取失败: ${e && e.message ? e.message : e}`);
         }
 
         createStockInfoFile();
@@ -1159,7 +1162,7 @@ async function getStocksByPage(page, retryCount = 0, session) {
             total: data.data.total || 0
         };
     } catch (error) {
-        console.error(`Page ${page} error: ${error.message}`);
+        console.log(`Page ${page} error: ${error.message}`);
         const statusCode = error && typeof error.statusCode === 'number' ? error.statusCode : null;
         const isBlocked = statusCode === 517 || statusCode === 403 || statusCode === 429 || statusCode === 503;
         if (isBlocked) {
@@ -1177,7 +1180,7 @@ async function getStocksByPage(page, retryCount = 0, session) {
             }
             return getStocksByPage(page, retryCount + 1, session);
         }
-        console.error(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
+        console.log(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
         return null;
     }
 }

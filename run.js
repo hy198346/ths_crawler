@@ -41,7 +41,7 @@ function getExternUserFileSizeForNotice() {
 function sendServerChan(message) {
   if (!SERVERCHAN_KEY) {
     console.warn('未设置SERVERCHAN_KEY，跳过Server酱通知');
-    return;
+    return Promise.resolve(false);
   }
 
   const title = encodeURIComponent('同花顺概念更新成功');
@@ -53,29 +53,39 @@ function sendServerChan(message) {
     method: 'GET'
   };
 
-  const req = https.request(options, (res) => {
-    let responseBody = '';
-    res.on('data', (chunk) => responseBody += chunk);
-    res.on('end', () => {
-      console.log('Server酱通知状态:', res.statusCode);
-      try {
-        const result = JSON.parse(responseBody);
-        if (result.code === 0) {
-          console.log('✅ Server酱通知发送成功');
-        } else {
-          console.error('❌ Server酱发送失败:', result.message);
+  return new Promise((resolve) => {
+    const req = https.request(options, (res) => {
+      let responseBody = '';
+      res.on('data', (chunk) => responseBody += chunk);
+      res.on('end', () => {
+        console.log('Server酱通知状态:', res.statusCode);
+        try {
+          const result = JSON.parse(responseBody);
+          if (result.code === 0) {
+            console.log('✅ Server酱通知发送成功');
+            resolve(true);
+          } else {
+            console.error('❌ Server酱发送失败:', result.message);
+            resolve(false);
+          }
+        } catch (e) {
+          console.error('Server酱响应解析失败:', e.message);
+          resolve(false);
         }
-      } catch (e) {
-        console.error('Server酱响应解析失败:', e.message);
-      }
+      });
     });
-  });
 
-  req.on('error', (error) => {
-    console.error('Server酱请求失败:', error.message);
-  });
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('Server酱请求超时'));
+    });
 
-  req.end();
+    req.on('error', (error) => {
+      console.error('Server酱请求失败:', error.message);
+      resolve(false);
+    });
+
+    req.end();
+  });
 }
 
 function runCrawler() {
@@ -86,7 +96,7 @@ function runCrawler() {
   console.log(`${logPrefix} 开始执行爬虫 (${startTime.toLocaleTimeString()})...`);
   
   const child = exec(
-    'node crawler.js',
+    'node runner.js',
     { timeout: EXEC_TIMEOUT },
     (error, stdout, stderr) => {
       const endTime = new Date();
@@ -133,7 +143,7 @@ function runCrawler() {
           `**输出摘要**: ${stdout.trim().slice(-100)}`
         ].join('\n\n');
         
-        sendServerChan(successMessage);
+        sendServerChan(successMessage).finally(() => process.exit(0));
         return;
       }
 
@@ -162,11 +172,11 @@ function runCrawler() {
           `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`
         ].join('\n\n');
-        sendServerChan(errorMessage);
-        
-        console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
-        console.error('最后输出:', stdout.trim().slice(-500) || '无输出');
-        process.exit(1);
+        sendServerChan(errorMessage).finally(() => {
+          console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
+          console.error('最后输出:', stdout.trim().slice(-500) || '无输出');
+          process.exit(1);
+        });
       }
     }
   );
