@@ -15,11 +15,13 @@ const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'sz,sh')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-const CNINFO_QUERIES = (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : ['sz']).map((plate) => {
+const CNINFO_QUERIES = [];
+for (const plate of (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : ['sz'])) {
     const p = String(plate || '').trim();
     const column = p === 'sh' ? 'sse' : 'szse';
-    return { plate: p, column };
-});
+    CNINFO_QUERIES.push({ plate: p, column });
+    CNINFO_QUERIES.push({ plate: p, column, category: 'category_yjdbg_szsh' });
+}
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 100);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
 const ANNOUNCEMENT_MAX_PER_STOCK_DAY = Number(process.env.ANNOUNCEMENT_MAX_PER_STOCK_DAY || 10);
@@ -178,28 +180,38 @@ function cacheRecTitles(rec) {
 function ensureStockNameInLine(line, stockName) {
     const name = cleanOneLine(stockName || '');
     if (!name) return String(line || '');
+    const rawLine = String(line || '');
     const parts = String(line || '').split('|');
     if (!parts || parts.length < 5) return String(line || '');
-    const msg0 = cleanOneLine(parts[3] || '');
+    const msgOrig = cleanOneLine(parts[3] || '');
+    let msg0 = msgOrig;
     if (!msg0) return String(line || '');
+    msg0 = msg0.replace(/^(\d{4}-\d{2}-\d{2})\s+24:/, '$1 00:');
     const mFix = /^(\d{4}-\d{2}-\d{2})\s+(.+?)\s+(\d{2}:\d{2}:\d{2})\s+(.*)$/.exec(msg0);
     if (mFix && cleanOneLine(mFix[2]) === name) {
-        parts[3] = `${mFix[1]} ${mFix[3]} ${name} ${mFix[4]}`;
+        const t = String(mFix[3] || '').replace(/^24:/, '00:');
+        parts[3] = `${mFix[1]} ${t} ${name} ${mFix[4]}`;
         return parts.join('|');
     }
     let timePart = '';
     let rest = '';
     const mDateTime = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(.*)$/.exec(msg0);
     if (mDateTime) {
-        timePart = mDateTime[1];
+        timePart = String(mDateTime[1] || '').replace(/^(\d{4}-\d{2}-\d{2})\s+24:/, '$1 00:');
         rest = mDateTime[2];
     } else {
         const m = /^(\S+)\s+(.*)$/.exec(msg0);
         if (!m) return String(line || '');
-        timePart = m[1];
+        timePart = String(m[1] || '').replace(/^(\d{4}-\d{2}-\d{2})\s+24:/, '$1 00:');
         rest = m[2];
     }
-    if (rest === name || rest.startsWith(`${name} `)) return String(line || '');
+    if (rest === name || rest.startsWith(`${name} `)) {
+        if (msg0 !== msgOrig) {
+            parts[3] = msg0;
+            return parts.join('|');
+        }
+        return rawLine;
+    }
     parts[3] = `${timePart} ${name} ${rest}`;
     return parts.join('|');
 }
@@ -351,7 +363,8 @@ function formatCninfoTime(v) {
     for (const p of parts) {
         if (p.type !== 'literal') m[p.type] = p.value;
     }
-    return `${m.year}-${m.month}-${m.day} ${m.hour}:${m.minute}:${m.second}`;
+    const hh = m.hour === '24' ? '00' : m.hour;
+    return `${m.year}-${m.month}-${m.day} ${hh}:${m.minute}:${m.second}`;
 }
 
 function requestBuffer(targetUrl, { method = 'GET', headers = {}, body = null, timeoutMs = 15000 } = {}) {
@@ -409,7 +422,7 @@ function requestBuffer(targetUrl, { method = 'GET', headers = {}, body = null, t
     });
 }
 
-async function cninfoQuery({ seDate, pageNum, pageSize, column, plate }) {
+async function cninfoQuery({ seDate, pageNum, pageSize, column, plate, category }) {
     const url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query';
     const headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -429,7 +442,7 @@ async function cninfoQuery({ seDate, pageNum, pageSize, column, plate }) {
         stock: '',
         searchkey: '',
         secid: '',
-        category: '',
+        category: String(category || ''),
         trade: '',
         seDate: String(seDate || ''),
         sortName: 'time',
@@ -473,15 +486,17 @@ async function cninfoDailyByStock(dateStr) {
     for (const q of queries) {
         const plate = q && q.plate ? String(q.plate) : '';
         const column = q && q.column ? String(q.column) : 'szse';
+        const category = q && q.category ? String(q.category) : '';
         let stallCount = 0;
+        let lastPageSig = '';
         for (let page = 1; page <= maxPages; page += 1) {
             let j;
             try {
-                console.log(`ANN CNINFO query: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
-                j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate });
+                console.log(`ANN CNINFO query: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
+                j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate, category });
             } catch (e) {
                 cninfoFailCnt++;
-                console.warn(`CNINFO daily query failed: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
+                console.warn(`CNINFO daily query failed: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
                 break;
             }
             const items = j && Array.isArray(j.announcements) ? j.announcements : null;
@@ -489,10 +504,31 @@ async function cninfoDailyByStock(dateStr) {
                 console.log(`ANN CNINFO empty: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page}`);
                 break;
             }
+            const totalPages = j && Number.isFinite(Number(j.totalpages)) ? Number(j.totalpages) : 0;
+            const pageSig = items
+                .map((it) => {
+                    const secCode = String((it && (it.secCode || it.sec_code)) || '').trim();
+                    const announcementId = String((it && (it.announcementId || it.announcement_id)) || '').trim();
+                    const epochMs = cninfoEpochMs((it && (it.announcementTime || it.announcement_time)) || '') || 0;
+                    const title = String((it && (it.announcementTitle || it.announcement_title)) || '')
+                        .replace(/[\r\n]+/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    const adjunctUrl = String((it && (it.adjunctUrl || it.adjunct_url)) || '').trim();
+                    if (announcementId) return `id:${announcementId}`;
+                    return `k:${secCode}|${epochMs}|${adjunctUrl}|${title}`;
+                })
+                .join(',');
+            if (totalPages <= 0) {
+                if (pageSig && lastPageSig && pageSig === lastPageSig) stallCount += 1;
+                else stallCount = 0;
+            } else {
+                stallCount = 0;
+            }
+            lastPageSig = pageSig;
             console.log(`ANN CNINFO items: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length}`);
             let addedNewStock = 0;
             let addedNewAnn = 0;
-            let newAnnOnPage = 0;
             for (const item of items) {
                 const secCode = String(item.secCode || item.sec_code || '').trim();
                 if (!secCode) continue;
@@ -504,7 +540,6 @@ async function cninfoDailyByStock(dateStr) {
                 const seenKey = announcementId ? `id:${announcementId}` : `k:${secCode}|${epochMs}|${adjunctUrl}|${title}`;
                 if (seenAnn.has(seenKey)) continue;
                 seenAnn.add(seenKey);
-                newAnnOnPage += 1;
                 let entry = out.get(secCode);
                 if (!entry) {
                     entry = {
@@ -531,17 +566,14 @@ async function cninfoDailyByStock(dateStr) {
                 }
             }
             console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
-            if (newAnnOnPage === 0) {
-                stallCount += 1;
-            } else {
-                stallCount = 0;
-            }
-            if (stallLimit && stallCount >= stallLimit) {
+            if (totalPages <= 0 && stallLimit && stallCount >= stallLimit) {
                 console.log(`ANN CNINFO stop on stall: plate=${plate || 'na'} col=${column} date=${dateStr} stallPages=${stallCount}`);
                 break;
             }
-            if (items.length < pageSize) {
-                console.log(`ANN CNINFO stop on tail: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length} pageSize=${pageSize}`);
+            if (totalPages > 0 ? page >= totalPages : items.length < pageSize) {
+                console.log(
+                    `ANN CNINFO stop on tail: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length} pageSize=${pageSize} totalPages=${totalPages || 'na'}`
+                );
                 break;
             }
         }
