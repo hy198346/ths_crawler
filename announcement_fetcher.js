@@ -39,6 +39,7 @@ const ANN_OUTPUT_PATH = process.env.ANN_OUTPUT_PATH || path.join(__dirname, 'ext
 const ANN_SUMMARY_CACHE_PATH = process.env.ANN_SUMMARY_CACHE_PATH || path.join(__dirname, 'extern_user_ann_cache.json');
 const ANN_PRINT_UPDATED = ['1', 'true', 'yes', 'on'].includes(String(process.env.ANN_PRINT_UPDATED || '').trim().toLowerCase());
 const ANN_PRINT_UPDATED_LIMIT = Number(process.env.ANN_PRINT_UPDATED_LIMIT || 50);
+const ANN_RUN_TIMES = Number(process.env.ANN_RUN_TIMES || 3);
 const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'stock_list.json');
 
 let tunnelHttpsAgent = null;
@@ -815,60 +816,107 @@ async function main() {
     const today = cninfoDateString(0);
     const yesterday = cninfoDateString(-1);
     console.log(`ANN Dates: today=${today} yesterday=${yesterday}`);
-    const merged = await cninfoPickDayForTodayAndYesterday();
-    const annList = Array.from(merged.values());
-    console.log(`ANN Latest unique stocks: ${annList.length}`);
     const summaryCache = loadSummaryCache(ANN_SUMMARY_CACHE_PATH);
-    let cacheHitCnt = 0;
-    const titleHitStocks = new Set();
+    const runTimes = Number.isFinite(ANN_RUN_TIMES) && ANN_RUN_TIMES > 0 ? Math.floor(ANN_RUN_TIMES) : 1;
+    const runs = Math.min(Math.max(runTimes, 1), 10);
+    console.log(`ANN Runs: ${runs}`);
+    const oldOut = loadExistingOutputLines(ANN_OUTPUT_PATH);
+    const mergedOrder = oldOut.order.slice();
+    const mergedMap = new Map(oldOut.map);
+    let totalAdded = 0;
+    let totalUpdated = 0;
+    let totalUnchanged = 0;
+    let totalCacheHit = 0;
+    let lastFetchedCnt = 0;
+    let lastAnnListLen = 0;
     if (LLM_API_KEY && !pdfParse && !llmPdfParserMissingNoted) {
         llmPdfParserMissingNoted = true;
         addLlmErrorLine('pdf-parse 不可用，LLM 输入将退化为标题文本，无法通读公告正文。');
     }
 
-    const summaries = await summarizeWithConcurrency(
-        annList,
-        ANNOUNCEMENT_SUMMARY_CONCURRENCY,
-        async (entry) => {
-            const secCode = entry && entry.secCode ? String(entry.secCode) : '';
-            const secName = entry && entry.secName ? String(entry.secName) : '';
-            const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
-            const annsAll = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
-            const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
-                ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
-                : 0;
-            const anns = cap ? annsAll.slice(0, cap) : annsAll;
-            llmDebugLog(`ANN Summarize: sec=${secCode || ''} anns=${anns.length} pdf=${LLM_API_KEY && pdfParse ? 'on' : 'off'}`);
-            const titles = anns.map((a) => cleanOneLine(a.title || '')).filter(Boolean);
-            const titleJoined = titles.join('；');
+    for (let run = 1; run <= runs; run += 1) {
+        console.log(`ANN Run: ${run}/${runs}`);
+        const merged = await cninfoPickDayForTodayAndYesterday();
+        const annList = Array.from(merged.values());
+        console.log(`ANN Latest unique stocks: ${annList.length}`);
+        lastAnnListLen = annList.length;
+        let cacheHitCnt = 0;
+        const titleHitStocks = new Set();
 
-            const payloadTitle = titleJoined || (titles[0] || '');
-            const cacheRec = secCode && summaryCache && summaryCache[secCode] ? summaryCache[secCode] : null;
-            const cachedTitles = cacheRecTitles(cacheRec);
-            const cachedSet = new Set(cachedTitles);
-            const currentAllTitles = titlesFromAnns(annsAll);
-            const currentAllKeys = keysFromAnns(annsAll);
-            const cachedKeys = cacheRec && Array.isArray(cacheRec.keys) ? cacheRec.keys.map((x) => String(x || '')) : [];
-            const cachedKeySet = new Set(cachedKeys);
-            const missingKeys = currentAllKeys.filter((k) => !cachedKeySet.has(k));
-            const missingTitles = currentAllTitles.filter((t) => !cachedSet.has(t));
-            const isOld = currentAllKeys.length ? missingKeys.length === 0 : missingTitles.length === 0;
-            if (cacheRec && cacheRec.s && isOld) {
-                cacheHitCnt += 1;
-                if (secCode) titleHitStocks.add(secCode);
-                summaryCache[secCode] = {
-                    ...cacheRec,
-                    keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
-                    titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
-                    ts: Date.now()
-                };
-                return String(cacheRec.s);
-            }
-            if (!LLM_API_KEY || !pdfParse) {
+        const summaries = await summarizeWithConcurrency(
+            annList,
+            ANNOUNCEMENT_SUMMARY_CONCURRENCY,
+            async (entry) => {
+                const secCode = entry && entry.secCode ? String(entry.secCode) : '';
+                const secName = entry && entry.secName ? String(entry.secName) : '';
+                const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
+                const annsAll = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+                const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
+                    ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
+                    : 0;
+                const anns = cap ? annsAll.slice(0, cap) : annsAll;
+                llmDebugLog(`ANN Summarize: sec=${secCode || ''} anns=${anns.length} pdf=${LLM_API_KEY && pdfParse ? 'on' : 'off'}`);
+                const titles = anns.map((a) => cleanOneLine(a.title || '')).filter(Boolean);
+                const titleJoined = titles.join('；');
+
+                const payloadTitle = titleJoined || (titles[0] || '');
+                const cacheRec = secCode && summaryCache && summaryCache[secCode] ? summaryCache[secCode] : null;
+                const cachedTitles = cacheRecTitles(cacheRec);
+                const cachedSet = new Set(cachedTitles);
+                const currentAllTitles = titlesFromAnns(annsAll);
+                const currentAllKeys = keysFromAnns(annsAll);
+                const cachedKeys = cacheRec && Array.isArray(cacheRec.keys) ? cacheRec.keys.map((x) => String(x || '')) : [];
+                const cachedKeySet = new Set(cachedKeys);
+                const missingKeys = currentAllKeys.filter((k) => !cachedKeySet.has(k));
+                const missingTitles = currentAllTitles.filter((t) => !cachedSet.has(t));
+                const isOld = currentAllKeys.length ? missingKeys.length === 0 : missingTitles.length === 0;
+                if (cacheRec && cacheRec.s && isOld) {
+                    cacheHitCnt += 1;
+                    if (secCode) titleHitStocks.add(secCode);
+                    summaryCache[secCode] = {
+                        ...cacheRec,
+                        keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
+                        titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
+                        ts: Date.now()
+                    };
+                    return String(cacheRec.s);
+                }
+                if (!LLM_API_KEY || !pdfParse) {
+                    const out = await llmSummarizeAnnouncement(
+                        { secCode, secName, announcementTime, announcementTitle: payloadTitle },
+                        ANNOUNCEMENT_SUMMARY_CHARS,
+                        payloadTitle
+                    );
+                    if (secCode && out) {
+                        summaryCache[secCode] = {
+                            ...cacheRec,
+                            keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
+                            titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
+                            s: out,
+                            ts: Date.now()
+                        };
+                    }
+                    return out;
+                }
+
+                const pdfTexts = await summarizeWithConcurrency(
+                    anns,
+                    ANNOUNCEMENT_PDF_CONCURRENCY,
+                    async (a) => fetchAnnouncementPdfText(a)
+                );
+                const bodyBlocks = [];
+                for (let i = 0; i < anns.length; i += 1) {
+                    const a = anns[i];
+                    const t = cleanOneLine(a && a.title ? a.title : '');
+                    const body = cleanOneLine(pdfTexts[i] || '');
+                    if (!t && !body) continue;
+                    bodyBlocks.push(`【${t}】${body}`);
+                }
+                const payloadText = bodyBlocks.length ? bodyBlocks.join(' ') : payloadTitle;
                 const out = await llmSummarizeAnnouncement(
                     { secCode, secName, announcementTime, announcementTitle: payloadTitle },
                     ANNOUNCEMENT_SUMMARY_CHARS,
-                    payloadTitle
+                    payloadText
                 );
                 if (secCode && out) {
                     summaryCache[secCode] = {
@@ -881,91 +929,71 @@ async function main() {
                 }
                 return out;
             }
+        );
 
-            const pdfTexts = await summarizeWithConcurrency(
-                anns,
-                ANNOUNCEMENT_PDF_CONCURRENCY,
-                async (a) => fetchAnnouncementPdfText(a)
-            );
-            const bodyBlocks = [];
-            for (let i = 0; i < anns.length; i += 1) {
-                const a = anns[i];
-                const t = cleanOneLine(a && a.title ? a.title : '');
-                const body = cleanOneLine(pdfTexts[i] || '');
-                if (!t && !body) continue;
-                bodyBlocks.push(`【${t}】${body}`);
-            }
-            const payloadText = bodyBlocks.length ? bodyBlocks.join(' ') : payloadTitle;
-            const out = await llmSummarizeAnnouncement(
-                { secCode, secName, announcementTime, announcementTitle: payloadTitle },
-                ANNOUNCEMENT_SUMMARY_CHARS,
-                payloadText
-            );
-            if (secCode && out) {
-                summaryCache[secCode] = {
-                    ...cacheRec,
-                    keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
-                    titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
-                    s: out,
-                    ts: Date.now()
-                };
-            }
-            return out;
+        const newMap = new Map();
+        const newOrder = [];
+        let cnt = 0;
+        for (let i = 0; i < annList.length; i += 1) {
+            const ann = annList[i];
+            const stockId = ann && ann.secCode ? String(ann.secCode) : '';
+            if (!stockId) continue;
+            const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
+            const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
+            const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
+            if (!t || !s) continue;
+            const line = `${exchangeId}|${stockId}|22|${t} ${s}|0.000`;
+            if (!newMap.has(stockId)) newOrder.push(stockId);
+            newMap.set(stockId, line);
+            cnt++;
         }
-    );
-    const oldOut = loadExistingOutputLines(ANN_OUTPUT_PATH);
-    const newMap = new Map();
-    const newOrder = [];
-    let cnt = 0;
-    for (let i = 0; i < annList.length; i += 1) {
-        const ann = annList[i];
-        const stockId = ann && ann.secCode ? String(ann.secCode) : '';
-        if (!stockId) continue;
-        const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
-        const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
-        const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
-        if (!t || !s) continue;
-        const line = `${exchangeId}|${stockId}|22|${t} ${s}|0.000`;
-        if (!newMap.has(stockId)) newOrder.push(stockId);
-        newMap.set(stockId, line);
-        cnt++;
-    }
-    const mergedOrder = oldOut.order.slice();
-    const mergedMap = new Map(oldOut.map);
-    let updated = 0;
-    let added = 0;
-    let unchanged = 0;
-    let updatedPrinted = 0;
-    for (const stockId of newOrder) {
-        const line = newMap.get(stockId);
-        if (!line) continue;
-        const oldLine = mergedMap.get(stockId);
-        if (oldLine) {
-            if (titleHitStocks.has(stockId)) {
-                unchanged += 1;
-                continue;
+
+        let updated = 0;
+        let added = 0;
+        let unchanged = 0;
+        let updatedPrinted = 0;
+        for (const stockId of newOrder) {
+            const line = newMap.get(stockId);
+            if (!line) continue;
+            const oldLine = mergedMap.get(stockId);
+            if (oldLine) {
+                if (titleHitStocks.has(stockId)) {
+                    unchanged += 1;
+                    continue;
+                }
+                if (oldLine === line) {
+                    unchanged += 1;
+                    continue;
+                }
+                updated += 1;
+                if (
+                    ANN_PRINT_UPDATED &&
+                    updatedPrinted <
+                        (Number.isFinite(ANN_PRINT_UPDATED_LIMIT) && ANN_PRINT_UPDATED_LIMIT > 0 ? Math.floor(ANN_PRINT_UPDATED_LIMIT) : 0)
+                ) {
+                    updatedPrinted += 1;
+                    console.log(`ANN Updated: ${stockId} old="${oldLine}" new="${line}"`);
+                }
+            } else {
+                mergedOrder.push(stockId);
+                added += 1;
             }
-            if (oldLine === line) {
-                unchanged += 1;
-                continue;
-            }
-            updated += 1;
-            if (ANN_PRINT_UPDATED && updatedPrinted < (Number.isFinite(ANN_PRINT_UPDATED_LIMIT) && ANN_PRINT_UPDATED_LIMIT > 0 ? Math.floor(ANN_PRINT_UPDATED_LIMIT) : 0)) {
-                updatedPrinted += 1;
-                console.log(`ANN Updated: ${stockId} old="${oldLine}" new="${line}"`);
-            }
-        } else {
-            mergedOrder.push(stockId);
-            added += 1;
+            mergedMap.set(stockId, line);
         }
-        mergedMap.set(stockId, line);
+
+        lastFetchedCnt = cnt;
+        totalAdded += added;
+        totalUpdated += updated;
+        totalUnchanged += unchanged;
+        totalCacheHit += cacheHitCnt;
+        console.log(`ANN Run merged: cnt=${cnt} new=${added} updated=${updated} unchanged=${unchanged} cacheHit=${cacheHitCnt}`);
     }
     const lines = mergedOrder.map((k) => mergedMap.get(k)).filter(Boolean).concat(oldOut.extra);
     fs.writeFileSync(ANN_OUTPUT_PATH, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
-    console.log(`公告家数: ${cnt} 合并: total=${lines.length} new=${added} updated=${updated} unchanged=${unchanged}`);
+    console.log(`公告家数: ${mergedMap.size} 合并: total=${lines.length} new=${totalAdded} updated=${totalUpdated} unchanged=${totalUnchanged}`);
     saveSummaryCache(ANN_SUMMARY_CACHE_PATH, summaryCache);
-    if (cacheHitCnt > 0) console.log(`ANN Cache hit: ${cacheHitCnt}`);
-    const llmAbnormal = !LLM_API_KEY || llmFailCnt > 0 || llmErrorLines.length > 0 || (annList.length > 0 && llmUsedCnt === 0);
+    if (totalCacheHit > 0) console.log(`ANN Cache hit: ${totalCacheHit}`);
+    const llmAbnormal = !LLM_API_KEY || llmFailCnt > 0 || llmErrorLines.length > 0 || (lastAnnListLen > 0 && llmUsedCnt === 0);
     if (llmAbnormal) {
         console.warn(`ANN LLM ALERT: used=${llmUsedCnt} fail=${llmFailCnt} fallback=${llmFallbackCnt} sameAsTitle=${llmSameAsTitleCnt}`);
         for (const one of llmErrorLines.slice(0, 12)) {
@@ -975,7 +1003,9 @@ async function main() {
             console.warn(`ANN LLM ERROR: 其余 ${llmErrorLines.length - 12} 条已省略`);
         }
     }
-    console.log(`ANN Done: written=${cnt} cninfoFail=${cninfoFailCnt} llmUsed=${llmUsedCnt} llmSameAsTitle=${llmSameAsTitleCnt} llmFallback=${llmFallbackCnt} llmFail=${llmFailCnt}`);
+    console.log(
+        `ANN Done: written=${mergedMap.size} lastRunWritten=${lastFetchedCnt} runs=${runs} cninfoFail=${cninfoFailCnt} llmUsed=${llmUsedCnt} llmSameAsTitle=${llmSameAsTitleCnt} llmFallback=${llmFallbackCnt} llmFail=${llmFailCnt}`
+    );
 }
 
 main().catch((e) => {
