@@ -47,6 +47,8 @@ jobs:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           ANNOUNCEMENT_SUMMARY_CHARS: ${{ secrets.ANNOUNCEMENT_SUMMARY_CHARS }}
           KIMI_DEBUG: ${{ secrets.KIMI_DEBUG }}
+          ANNOUNCE_KIMI_TOP_N: ${{ secrets.ANNOUNCE_KIMI_TOP_N }}
+          
         run: |
           echo "当前工作目录: $(pwd)"
           node run.js 
