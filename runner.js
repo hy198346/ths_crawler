@@ -1,4 +1,4 @@
-const { execFile } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const iconv = require('iconv-lite');
@@ -8,32 +8,41 @@ const THS_TMP_PATH = process.env.THS_TMP_PATH || path.join(ROOT, 'extern_user_th
 const ANN_TMP_PATH = process.env.ANN_TMP_PATH || path.join(ROOT, 'extern_user_ann.txt');
 const OUT_PATH = process.env.OUT_PATH || path.join(ROOT, 'extern_user.txt');
 
+function appendTail(cur, chunk, maxChars) {
+    const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
+    const next = `${String(cur || '')}${String(chunk || '')}`;
+    if (!cap) return next;
+    return next.length > cap ? next.slice(next.length - cap) : next;
+}
+
 function runNode(script, envOverrides = {}) {
     return new Promise((resolve) => {
-        const child = execFile(
-            process.execPath,
-            [path.join(ROOT, script)],
-            {
-                env: { ...process.env, ...envOverrides },
-                windowsHide: true,
-                maxBuffer: 64 * 1024 * 1024
-            },
-            (error, stdout, stderr) => {
-                const errMsg = error && error.message ? String(error.message) : (error ? String(error) : '');
-                let mergedStderr = String(stderr || '');
-                if (errMsg && !mergedStderr.includes(errMsg)) {
-                    mergedStderr = `${mergedStderr}${mergedStderr ? '\n' : ''}${errMsg}\n`;
-                }
-                resolve({
-                    ok: !error,
-                    code: error && typeof error.code === 'number' ? error.code : 0,
-                    stdout: String(stdout || ''),
-                    stderr: mergedStderr
-                });
-            }
-        );
+        const cap = Number(process.env.RUNNER_CHILD_CAPTURE_MAX_CHARS || 2000000);
+        let stdout = '';
+        let stderr = '';
+        let closed = false;
+        const child = spawn(process.execPath, [path.join(ROOT, script)], {
+            env: { ...process.env, ...envOverrides },
+            windowsHide: true
+        });
+        child.stdout.on('data', (data) => {
+            stdout = appendTail(stdout, String(data || ''), cap);
+        });
+        child.stderr.on('data', (data) => {
+            stderr = appendTail(stderr, String(data || ''), cap);
+        });
         child.on('error', (e) => {
-            resolve({ ok: false, code: 1, stdout: '', stderr: String(e && e.message ? e.message : e) });
+            if (closed) return;
+            closed = true;
+            stderr = appendTail(stderr, String(e && e.message ? e.message : e), cap);
+            resolve({ ok: false, code: 1, stdout, stderr });
+        });
+        child.on('close', (code, signal) => {
+            if (closed) return;
+            closed = true;
+            const exitCode = Number.isFinite(code) ? code : 1;
+            if (signal) stderr = appendTail(stderr, `killed by signal: ${signal}\n`, cap);
+            resolve({ ok: exitCode === 0, code: exitCode, stdout, stderr });
         });
     });
 }

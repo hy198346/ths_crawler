@@ -9,6 +9,8 @@ on:
     paths-ignore:
       - extern_user.txt.gz
       - extern_user_ann_cache.json
+      - extern_user_ann.txt
+      - extern_user_kimi_digest.md
   pull_request:
     branches:
       - main
@@ -92,13 +94,19 @@ jobs:
           # 添加压缩文件、公告缓存和package-lock.json
           git add extern_user.txt.gz
           git add extern_user_ann_cache.json
+          if [ -f "extern_user_ann.txt" ]; then
+            git add extern_user_ann.txt
+          fi
+          if [ -f "extern_user_kimi_digest.md" ]; then
+            git add extern_user_kimi_digest.md
+          fi
           git add package-lock.json
           
           # 检查是否有变化
           if git diff --staged --quiet; then
             echo "⚠️ 没有变化需要提交"
           else
-            git commit -m "Auto-commit: 压缩的extr_user.txt.gz和package-lock.json [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
+            git commit -m "Auto-commit: update extern_user outputs [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
             git push origin HEAD:${{ github.ref }}
           fi
           

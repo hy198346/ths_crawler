@@ -241,6 +241,30 @@ function injectStockNamesIntoKimiSection(markdown, nameMap) {
   return out.join('\n');
 }
 
+function getKimiDigestCachePath() {
+  if (process.env.ANNOUNCE_KIMI_CACHE_PATH) return path.resolve(process.env.ANNOUNCE_KIMI_CACHE_PATH);
+  return path.resolve(__dirname, 'extern_user_kimi_digest.md');
+}
+
+function loadKimiDigestCache() {
+  const p = getKimiDigestCachePath();
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    return String(raw || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function saveKimiDigestCache(markdown) {
+  const p = getKimiDigestCachePath();
+  const s = String(markdown || '').trim();
+  if (!s) return;
+  try {
+    fs.writeFileSync(p, `${s}\n`, 'utf8');
+  } catch {}
+}
+
 async function getAnnouncementDigestByKimi() {
   if (!LLM_API_KEY) return '';
   let parsed;
@@ -309,7 +333,9 @@ async function getAnnouncementDigestByKimi() {
     const out = String(content || '');
     const normalized = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).join('\n\n');
     if (!normalized) return '';
-    return `### 📌 公告要闻（Kimi精选）\n\n${normalized}\n\n（共${parsed.count}条公告）`;
+    const md = `### 📌 公告要闻（Kimi精选）\n\n${normalized}\n\n（共${parsed.count}条公告）`;
+    saveKimiDigestCache(md);
+    return md;
   } catch (e) {
     const sc = e && e.statusCode ? String(e.statusCode) : '';
     console.warn(`MAIL LLM digest failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
@@ -494,7 +520,8 @@ function runCrawler() {
           if (shouldSkipKimi) {
             console.log(`Kimi精选跳过：公告无新增/更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
           }
-          const kimiDigest = shouldSkipKimi ? '' : await getAnnouncementDigestByKimi();
+          const cachedKimi = loadKimiDigestCache();
+          const kimiDigest = shouldSkipKimi ? cachedKimi : (await getAnnouncementDigestByKimi()) || cachedKimi;
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const successMessage = [

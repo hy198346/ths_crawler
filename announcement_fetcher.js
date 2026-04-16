@@ -910,6 +910,28 @@ async function main() {
         const patched = ensureStockNameInLine(oldLine, nameMap.get(stockId) || '');
         if (patched && patched !== oldLine) mergedMap.set(stockId, patched);
     }
+    if (mergedOrder.length === 0 && mergedMap.size === 0 && summaryCache && typeof summaryCache === 'object') {
+        const arr = [];
+        for (const k of Object.keys(summaryCache)) {
+            const stockId = String(k || '').trim();
+            if (!stockId) continue;
+            const rec = summaryCache && summaryCache[stockId] ? summaryCache[stockId] : null;
+            const line = rec && rec.line ? String(rec.line).trim() : '';
+            if (!line) continue;
+            const parts = line.split('|');
+            if (!parts || parts.length < 5) continue;
+            if (String(parts[1] || '').trim() !== stockId) continue;
+            if (String(parts[2] || '').trim() !== '22') continue;
+            const patched = ensureStockNameInLine(line, nameMap.get(stockId) || '');
+            arr.push({ stockId, line: patched || line, ts: Number(rec && rec.ts ? rec.ts : 0) || 0 });
+        }
+        arr.sort((a, b) => (b.ts || 0) - (a.ts || 0) || String(a.stockId).localeCompare(String(b.stockId)));
+        for (const it of arr) {
+            mergedOrder.push(it.stockId);
+            mergedMap.set(it.stockId, it.line);
+        }
+        if (arr.length) console.log(`ANN Prefill from cache: ${arr.length}`);
+    }
     let totalAdded = 0;
     let totalUpdated = 0;
     let totalUnchanged = 0;
@@ -1035,6 +1057,16 @@ async function main() {
             if (!newMap.has(stockId)) newOrder.push(stockId);
             newMap.set(stockId, line);
             if (stockName) newStockNameMap.set(stockId, stockName);
+            {
+                const prev = summaryCache && summaryCache[stockId] ? summaryCache[stockId] : null;
+                summaryCache[stockId] = {
+                    ...(prev && typeof prev === 'object' ? prev : {}),
+                    t,
+                    n: stockName || (prev && prev.n ? prev.n : ''),
+                    line,
+                    ts: Date.now()
+                };
+            }
             cnt++;
         }
 
