@@ -8,9 +8,10 @@ try {
 } catch {}
 
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
-const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 400);
+const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 120);
 const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
 const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
+const CNINFO_LOG_EVERY_PAGES = Number(process.env.CNINFO_LOG_EVERY_PAGES || 10);
 const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'sz,sh')
     .split(',')
     .map((s) => s.trim())
@@ -492,7 +493,11 @@ async function cninfoDailyByStock(dateStr) {
         for (let page = 1; page <= maxPages; page += 1) {
             let j;
             try {
-                console.log(`ANN CNINFO query: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
+                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
+                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
+                if (shouldLog) {
+                    console.log(`ANN CNINFO query: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
+                }
                 j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate, category });
             } catch (e) {
                 cninfoFailCnt++;
@@ -526,7 +531,13 @@ async function cninfoDailyByStock(dateStr) {
                 stallCount = 0;
             }
             lastPageSig = pageSig;
-            console.log(`ANN CNINFO items: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length}`);
+            {
+                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
+                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
+                if (shouldLog) {
+                    console.log(`ANN CNINFO items: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length}`);
+                }
+            }
             let addedNewStock = 0;
             let addedNewAnn = 0;
             for (const item of items) {
@@ -565,7 +576,13 @@ async function cninfoDailyByStock(dateStr) {
                     entry.latestTime = timeStr;
                 }
             }
-            console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
+            {
+                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
+                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
+                if (shouldLog) {
+                    console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
+                }
+            }
             if (totalPages <= 0 && stallLimit && stallCount >= stallLimit) {
                 console.log(`ANN CNINFO stop on stall: plate=${plate || 'na'} col=${column} date=${dateStr} stallPages=${stallCount}`);
                 break;

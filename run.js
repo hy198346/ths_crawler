@@ -424,6 +424,7 @@ function runCrawler() {
   console.log(`${logPrefix} 开始执行爬虫 (${startTime.toLocaleTimeString()})...`);
   
   const captureMaxChars = Number(process.env.RUNNER_CAPTURE_MAX_CHARS || 2000000);
+  const dumpTailChars = Number(process.env.RUNNER_DUMP_TAIL_CHARS || 6000);
   let stdout = '';
   let stderr = '';
   let killed = false;
@@ -442,12 +443,12 @@ function runCrawler() {
   child.stdout.on('data', (data) => {
     const s = String(data || '');
     stdout = appendTail(stdout, s, captureMaxChars);
-    process.stdout.write(`${logPrefix} STDOUT > ${s}`);
+    process.stdout.write(s);
   });
   child.stderr.on('data', (data) => {
     const s = String(data || '');
     stderr = appendTail(stderr, s, captureMaxChars);
-    process.stderr.write(`${logPrefix} STDERR > ${s}`);
+    process.stderr.write(s);
   });
 
   child.on('close', (code) => {
@@ -459,8 +460,10 @@ function runCrawler() {
       
       // 记录执行结果
       console.log(`${logPrefix} 执行完成 (耗时: ${elapsed}秒)`);
-      console.log(`${logPrefix} stdout >>\n${stdout.trim() || '无输出'}\n<<`);
-      if (stderr) console.error(`${logPrefix} stderr >>\n${stderr.trim()}\n<<`);
+      const outTail = (stdout || '').slice(-Math.max(0, dumpTailChars)).trim();
+      const errTail = (stderr || '').slice(-Math.max(0, dumpTailChars)).trim();
+      console.log(`${logPrefix} stdoutTail >>\n${outTail || '无输出'}\n<<`);
+      if (errTail) console.error(`${logPrefix} stderrTail >>\n${errTail}\n<<`);
 
       // 检查超时
       if (error && error.killed) {
