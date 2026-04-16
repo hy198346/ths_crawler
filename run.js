@@ -173,6 +173,67 @@ function parseAnnouncementFileForLlm() {
   return { count: items.length, items };
 }
 
+function loadStockNameMap() {
+  const p = process.env.STOCK_LIST_PATH
+    ? path.resolve(process.env.STOCK_LIST_PATH)
+    : path.resolve(__dirname, 'stock_list.json');
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    const j = JSON.parse(raw);
+    const arr = Array.isArray(j) ? j : (j && Array.isArray(j.stocks) ? j.stocks : []);
+    const m = new Map();
+    for (const it of arr) {
+      const code = it && it.f12 ? String(it.f12).trim() : '';
+      const name = it && it.f14 ? String(it.f14).trim() : '';
+      if (!code || !name) continue;
+      if (!m.has(code)) m.set(code, name);
+    }
+    return m;
+  } catch {
+    return new Map();
+  }
+}
+
+function injectStockNamesIntoKimiSection(markdown, nameMap) {
+  const text = String(markdown || '');
+  if (!text || !text.includes('Kimi精选')) return text;
+  const lines = text.split(/\r?\n/);
+  let inKimi = false;
+  const out = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('###')) {
+      inKimi = trimmed.includes('Kimi精选');
+      out.push(line);
+      continue;
+    }
+    if (!inKimi) {
+      out.push(line);
+      continue;
+    }
+    const m = line.match(/^\s*-\s*(\d{6})\b(.*)$/);
+    if (!m) {
+      out.push(line);
+      continue;
+    }
+    const code = m[1];
+    const name = nameMap && nameMap.get(code) ? String(nameMap.get(code)) : '';
+    if (!name) {
+      out.push(line);
+      continue;
+    }
+    const rest = String(m[2] || '');
+    const restTrim = rest.trimStart();
+    if (restTrim.startsWith(name)) {
+      out.push(line);
+      continue;
+    }
+    const joiner = restTrim && /^[：:，,。．、;；!?！？]/.test(restTrim) ? '' : (restTrim ? ' ' : '');
+    out.push(`- ${code} ${name}${joiner}${restTrim}`);
+  }
+  return out.join('\n');
+}
+
 async function getAnnouncementDigestByKimi() {
   if (!LLM_API_KEY) return '';
   let parsed;
@@ -359,7 +420,8 @@ function runCrawler() {
           const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
           const llmAlertSummary = getLlmAlertSummaryForNotice(stdout, stderr);
           const kimiDigest = await getAnnouncementDigestByKimi();
-          const annSummary = kimiDigest || getAnnouncementSummaryForNotice();
+          const nameMap = loadStockNameMap();
+          const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const successMessage = [
             `### ✅ 爬虫任务成功执行`,
             `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -373,10 +435,13 @@ function runCrawler() {
             llmAlertSummary,
             annSummary
           ].filter(Boolean).join('\n\n');
+          console.log(`\n===== Server酱通知内容（预览）=====\n${successMessage}\n===== 结束 =====\n`);
           sendServerChan(successMessage).finally(() => process.exit(0));
         })().catch((e) => {
           console.error('Build notice failed:', e && e.message ? e.message : e);
-          sendServerChan(`### ✅ 爬虫任务成功执行\n\n但构建通知失败：${e && e.message ? e.message : e}`).finally(() => process.exit(0));
+          const fallbackMessage = `### ✅ 爬虫任务成功执行\n\n但构建通知失败：${e && e.message ? e.message : e}`;
+          console.log(`\n===== Server酱通知内容（预览）=====\n${fallbackMessage}\n===== 结束 =====\n`);
+          sendServerChan(fallbackMessage).finally(() => process.exit(0));
         });
         return;
       }
@@ -406,6 +471,7 @@ function runCrawler() {
           `**输出行数**: ${lineCount}`,
           `**extern_user.txt 大小**: ${externUserSize}`
         ].join('\n\n');
+        console.log(`\n===== Server酱通知内容（预览）=====\n${errorMessage}\n===== 结束 =====\n`);
         sendServerChan(errorMessage).finally(() => {
           console.error(`[中止] 达到最大重试次数 (${MAX_RETRIES}) 仍未成功`);
           console.error('最后输出:', stdout.trim().slice(-500) || '无输出');
@@ -424,7 +490,13 @@ function runCrawler() {
   });
 }
 
-// 启动
-console.log(`== 爬虫监控启动 ==`);
-console.log(`配置: ${MAX_RETRIES}次重试/每次间隔${RETRY_INTERVAL/1000}秒`);
-runCrawler();
+module.exports = {
+  loadStockNameMap,
+  injectStockNamesIntoKimiSection
+};
+
+if (require.main === module) {
+  console.log(`== 爬虫监控启动 ==`);
+  console.log(`配置: ${MAX_RETRIES}次重试/每次间隔${RETRY_INTERVAL/1000}秒`);
+  runCrawler();
+}
