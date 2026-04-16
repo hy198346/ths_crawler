@@ -45,4 +45,16 @@ const crawler_config = {
     adaptiveAdjustCooldownMs : 15000
 }
 
+const isGithubActions = String(process.env.GITHUB_ACTIONS || '').toLowerCase() === 'true';
+if (isGithubActions) {
+    const toNum = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+    crawler_config.taksCount = toNum(process.env.CI_TAKS_COUNT, 200);
+    crawler_config.workerCap = toNum(process.env.CI_WORKER_CAP, 200);
+    crawler_config.taskSleepCount = toNum(process.env.CI_TASK_SLEEP_COUNT, 2000);
+    crawler_config.stockMaxRetries = toNum(process.env.CI_STOCK_MAX_RETRIES, 2);
+    crawler_config.recoveryRounds = toNum(process.env.CI_RECOVERY_ROUNDS, 1);
+    crawler_config.recoveryMaxRetries = toNum(process.env.CI_RECOVERY_MAX_RETRIES, 4);
+    crawler_config.listConcurrency = toNum(process.env.CI_LIST_CONCURRENCY, 6);
+}
+
 exports.config = crawler_config;

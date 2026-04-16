@@ -5,9 +5,10 @@ const path = require('path');
 const tunnel = require('tunnel');
 
 // 配置参数
-const MAX_RETRIES = 5;         // 最大重试次数
-const RETRY_INTERVAL = 120000;   // 重试间隔(毫秒)
-const EXEC_TIMEOUT = 1800000;   // 执行超时时间(30分钟)
+const IS_GITHUB_ACTIONS = String(process.env.GITHUB_ACTIONS || '').toLowerCase() === 'true';
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || (IS_GITHUB_ACTIONS ? 2 : 5));
+const RETRY_INTERVAL = Number(process.env.RETRY_INTERVAL_MS || (IS_GITHUB_ACTIONS ? 60000 : 120000));
+const EXEC_TIMEOUT = Number(process.env.EXEC_TIMEOUT_MS || (IS_GITHUB_ACTIONS ? 15 * 60 * 1000 : 30 * 60 * 1000));
 const SUCCESS_FLAG = 'created'; // 成功标识
 const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
@@ -169,12 +170,20 @@ function parseAnnouncementFileForLlm() {
   const raw = fs.readFileSync(annPath, 'utf8');
   const lines = raw.split(/\r?\n/).filter(Boolean);
   const items = [];
+  const excludeMidnightToday = !['0', 'false', 'no', 'off'].includes(String(process.env.ANNOUNCE_KIMI_EXCLUDE_MIDNIGHT || '1').trim().toLowerCase());
+  const today = excludeMidnightToday
+    ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
+    : '';
   for (const line of lines) {
     const parts = line.split('|');
     if (parts.length < 5) continue;
     const stockId = String(parts[1] || '').trim();
     const text = cleanOneLine(parts[3] || '');
     if (!stockId || !text) continue;
+    if (excludeMidnightToday) {
+      const m = text.match(/^(\d{4}-\d{2}-\d{2})\s+00:00:00\b/);
+      if (m && m[1] === today) continue;
+    }
     items.push({ stockId, text });
   }
   return { count: items.length, items };
