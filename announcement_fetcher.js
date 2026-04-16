@@ -8,20 +8,22 @@ try {
 } catch {}
 
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
-const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 120);
+const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 300);
 const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
 const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
 const CNINFO_LOG_EVERY_PAGES = Number(process.env.CNINFO_LOG_EVERY_PAGES || 10);
-const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'sz,sh')
+const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'all')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
 const CNINFO_QUERIES = [];
 for (const plate of (CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES : ['sz'])) {
     const p = String(plate || '').trim();
-    const column = p === 'sh' ? 'sse' : 'szse';
-    CNINFO_QUERIES.push({ plate: p, column });
-    CNINFO_QUERIES.push({ plate: p, column, category: 'category_yjdbg_szsh' });
+    const isAll = p === 'all' || p === '*' || p === 'full' || p === 'both';
+    const column = isAll ? '' : (p === 'sh' ? 'sse' : 'szse');
+    const plateArg = isAll ? '' : p;
+    CNINFO_QUERIES.push({ plate: plateArg, column });
+    CNINFO_QUERIES.push({ plate: plateArg, column, category: 'category_yjdbg_szsh' });
 }
 const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS || 100);
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
@@ -48,6 +50,7 @@ const STOCK_CODES_PATH = process.env.STOCK_CODES_PATH
     ? path.resolve(process.env.STOCK_CODES_PATH)
     : path.join(__dirname, 'stock_codes.txt');
 const ANN_UPDATE_WINDOW_HOURS = Number(process.env.ANN_UPDATE_WINDOW_HOURS || 0);
+const ANN_LOOKBACK_DAYS = Number(process.env.ANN_LOOKBACK_DAYS || 2);
 
 let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;
@@ -229,6 +232,15 @@ function keysFromAnns(anns) {
         if (k) uniq.add(k);
     }
     return Array.from(uniq);
+}
+
+function pickLatestDayAnns(anns) {
+    const arr = Array.isArray(anns) ? anns : [];
+    if (!arr.length) return arr;
+    const topTime = String(arr[0] && arr[0].time ? arr[0].time : '').trim();
+    const day = topTime.length >= 10 ? topTime.slice(0, 10) : '';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return arr;
+    return arr.filter((a) => String(a && a.time ? a.time : '').slice(0, 10) === day);
 }
 
 function cutByChars(s, maxChars) {
@@ -489,9 +501,9 @@ async function cninfoDailyByStock(dateStr) {
     const queries = Array.isArray(CNINFO_QUERIES) && CNINFO_QUERIES.length ? CNINFO_QUERIES : [{ plate: 'sz', column: 'szse' }];
 
     for (const q of queries) {
-        const plate = q && q.plate ? String(q.plate) : '';
-        const column = q && q.column ? String(q.column) : 'szse';
-        const category = q && q.category ? String(q.category) : '';
+        const plate = q && q.plate !== undefined ? String(q.plate) : '';
+        const column = q && q.column !== undefined ? String(q.column) : 'szse';
+        const category = q && q.category !== undefined ? String(q.category) : '';
         let stallCount = 0;
         let lastPageSig = '';
         for (let page = 1; page <= maxPages; page += 1) {
@@ -528,13 +540,6 @@ async function cninfoDailyByStock(dateStr) {
                     return `k:${secCode}|${epochMs}|${adjunctUrl}|${title}`;
                 })
                 .join(',');
-            if (totalPages <= 0) {
-                if (pageSig && lastPageSig && pageSig === lastPageSig) stallCount += 1;
-                else stallCount = 0;
-            } else {
-                stallCount = 0;
-            }
-            lastPageSig = pageSig;
             {
                 const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
                 const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
@@ -587,11 +592,20 @@ async function cninfoDailyByStock(dateStr) {
                     console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
                 }
             }
+            if (totalPages <= 0) {
+                const sigSame = pageSig && lastPageSig && pageSig === lastPageSig;
+                const noNew = addedNewAnn === 0;
+                if (sigSame || noNew) stallCount += 1;
+                else stallCount = 0;
+            } else {
+                stallCount = 0;
+            }
+            lastPageSig = pageSig;
             if (totalPages <= 0 && stallLimit && stallCount >= stallLimit) {
                 console.log(`ANN CNINFO stop on stall: plate=${plate || 'na'} col=${column} date=${dateStr} stallPages=${stallCount}`);
                 break;
             }
-            if (totalPages > 0 ? page >= totalPages : items.length < pageSize) {
+            if (totalPages > 0 && page >= totalPages) {
                 console.log(
                     `ANN CNINFO stop on tail: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length} pageSize=${pageSize} totalPages=${totalPages || 'na'}`
                 );
@@ -628,54 +642,59 @@ async function cninfoDailyByStock(dateStr) {
     return out;
 }
 
-async function cninfoPickDayForTodayAndYesterday() {
-    const today = cninfoDateString(0);
-    const yesterday = cninfoDateString(-1);
-    const todayMap = await cninfoDailyByStock(today);
-    const yMap = await cninfoDailyByStock(yesterday);
+function cninfoMergeStockEntry(cur, next) {
+    if (!cur) return next;
+    if (!next) return cur;
+    const combined = []
+        .concat(Array.isArray(cur.announcements) ? cur.announcements : [])
+        .concat(Array.isArray(next.announcements) ? next.announcements : []);
+    const uniq = [];
+    const seen = new Set();
+    for (const a of combined) {
+        const id = a && a.announcementId ? String(a.announcementId) : '';
+        const key = id
+            ? `id:${id}`
+            : `t:${String(a && a.time ? a.time : '')}|${String(a && a.title ? a.title : '')}|${String(a && a.adjunctUrl ? a.adjunctUrl : '')}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        uniq.push(a);
+    }
+    uniq.sort((a, b) => {
+        const ea = Number(a && a.epochMs ? a.epochMs : 0) || 0;
+        const eb = Number(b && b.epochMs ? b.epochMs : 0) || 0;
+        if (eb !== ea) return eb - ea;
+        const ia = a && a.announcementId ? String(a.announcementId) : '';
+        const ib = b && b.announcementId ? String(b.announcementId) : '';
+        if (ib !== ia) return ib > ia ? 1 : -1;
+        const ta = cleanOneLine(a && a.title ? a.title : '');
+        const tb = cleanOneLine(b && b.title ? b.title : '');
+        if (tb !== ta) return tb > ta ? 1 : -1;
+        const ua = a && a.adjunctUrl ? String(a.adjunctUrl) : '';
+        const ub = b && b.adjunctUrl ? String(b.adjunctUrl) : '';
+        if (ub !== ua) return ub > ua ? 1 : -1;
+        return 0;
+    });
+    cur.announcements = uniq;
+    if ((next.latestEpochMs || 0) > (cur.latestEpochMs || 0)) {
+        cur.latestEpochMs = next.latestEpochMs || 0;
+        cur.latestTime = next.latestTime || '';
+    }
+    if (!cur.secName && next.secName) cur.secName = next.secName;
+    return cur;
+}
+
+async function cninfoPickDays(lookbackDays) {
+    const d = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
+    const days = Math.min(Math.max(d, 1), 14);
     const merged = new Map();
-    for (const [k, v] of todayMap.entries()) merged.set(k, v);
-    for (const [k, v] of yMap.entries()) {
-        const cur = merged.get(k);
-        if (!cur) {
-            merged.set(k, v);
-            continue;
+    for (let off = 0; off >= -(days - 1); off -= 1) {
+        const day = cninfoDateString(off);
+        const dayMap = await cninfoDailyByStock(day);
+        for (const [k, v] of dayMap.entries()) {
+            const cur = merged.get(k);
+            if (!cur) merged.set(k, v);
+            else merged.set(k, cninfoMergeStockEntry(cur, v));
         }
-        const combined = []
-            .concat(Array.isArray(cur.announcements) ? cur.announcements : [])
-            .concat(Array.isArray(v.announcements) ? v.announcements : []);
-        const uniq = [];
-        const seen = new Set();
-        for (const a of combined) {
-            const id = a && a.announcementId ? String(a.announcementId) : '';
-            const key = id
-                ? `id:${id}`
-                : `t:${String(a && a.time ? a.time : '')}|${String(a && a.title ? a.title : '')}|${String(a && a.adjunctUrl ? a.adjunctUrl : '')}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            uniq.push(a);
-        }
-        uniq.sort((a, b) => {
-            const ea = Number(a && a.epochMs ? a.epochMs : 0) || 0;
-            const eb = Number(b && b.epochMs ? b.epochMs : 0) || 0;
-            if (eb !== ea) return eb - ea;
-            const ia = a && a.announcementId ? String(a.announcementId) : '';
-            const ib = b && b.announcementId ? String(b.announcementId) : '';
-            if (ib !== ia) return ib > ia ? 1 : -1;
-            const ta = cleanOneLine(a && a.title ? a.title : '');
-            const tb = cleanOneLine(b && b.title ? b.title : '');
-            if (tb !== ta) return tb > ta ? 1 : -1;
-            const ua = a && a.adjunctUrl ? String(a.adjunctUrl) : '';
-            const ub = b && b.adjunctUrl ? String(b.adjunctUrl) : '';
-            if (ub !== ua) return ub > ua ? 1 : -1;
-            return 0;
-        });
-        cur.announcements = uniq;
-        if ((v.latestEpochMs || 0) > (cur.latestEpochMs || 0)) {
-            cur.latestEpochMs = v.latestEpochMs || 0;
-            cur.latestTime = v.latestTime || '';
-        }
-        if (!cur.secName && v.secName) cur.secName = v.secName;
     }
     return merged;
 }
@@ -918,9 +937,11 @@ async function main() {
     const { exchangeMap, nameMap } = loadStockMetaMaps();
     const stockCodes = loadStockCodesSet(exchangeMap);
     console.log(`ANN Stock list: path=${STOCK_LIST_PATH} size=${exchangeMap.size} codes=${stockCodes.size} codesPath=${STOCK_CODES_PATH}`);
+    const d = Number.isFinite(ANN_LOOKBACK_DAYS) && ANN_LOOKBACK_DAYS > 0 ? Math.floor(ANN_LOOKBACK_DAYS) : 1;
+    const lookbackDays = Math.min(Math.max(d, 1), 14);
     const today = cninfoDateString(0);
-    const yesterday = cninfoDateString(-1);
-    console.log(`ANN Dates: today=${today} yesterday=${yesterday}`);
+    const fromDay = cninfoDateString(-(lookbackDays - 1));
+    console.log(`ANN Dates: from=${fromDay} to=${today} lookbackDays=${lookbackDays}`);
     const summaryCache = loadSummaryCache(ANN_SUMMARY_CACHE_PATH);
     const runTimes = Number.isFinite(ANN_RUN_TIMES) && ANN_RUN_TIMES > 0 ? Math.floor(ANN_RUN_TIMES) : 1;
     const runs = Math.min(Math.max(runTimes, 1), 10);
@@ -969,7 +990,7 @@ async function main() {
 
     for (let run = 1; run <= runs; run += 1) {
         console.log(`ANN Run: ${run}/${runs}`);
-        const merged = await cninfoPickDayForTodayAndYesterday();
+        const merged = await cninfoPickDays(lookbackDays);
         const all = Array.from(merged.values()).filter((x) => x && x.secCode && stockCodes.has(String(x.secCode)));
         const windowHours = Number.isFinite(ANN_UPDATE_WINDOW_HOURS) && ANN_UPDATE_WINDOW_HOURS > 0 ? ANN_UPDATE_WINDOW_HOURS : 0;
         const nowMs = Date.now();
@@ -991,7 +1012,8 @@ async function main() {
                 const secCode = entry && entry.secCode ? String(entry.secCode) : '';
                 const secName = entry && entry.secName ? String(entry.secName) : '';
                 const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
-                const annsAll = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+                const annsAllRaw = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+                const annsAll = pickLatestDayAnns(annsAllRaw);
                 const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
                     ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
                     : 0;
