@@ -32,6 +32,7 @@ const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || '
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
+const ANN_USE_TUNNEL_PROXY = ['1', 'true', 'yes', 'on'].includes(String(process.env.ANN_USE_TUNNEL_PROXY || '').trim().toLowerCase());
 const ANN_TIME_FORMAT = String(process.env.ANN_TIME_FORMAT || '').trim().toLowerCase();
 const ANN_DECIMAL_DIGITS = Number(process.env.ANN_DECIMAL_DIGITS || 2);
 const ANN_OUTPUT_PATH = process.env.ANN_OUTPUT_PATH || path.join(__dirname, 'extern_user_ann.txt');
@@ -50,6 +51,7 @@ let llmPdfParserMissingNoted = false;
 const llmErrorLines = [];
 
 function getTunnelProxyConfig() {
+    if (!ANN_USE_TUNNEL_PROXY) return null;
     const tunnelStr = process.env.TUNNEL_PROXY ? String(process.env.TUNNEL_PROXY) : '';
     const username = process.env.TUNNEL_USERNAME ? String(process.env.TUNNEL_USERNAME) : '';
     const password = process.env.TUNNEL_PASSWORD ? String(process.env.TUNNEL_PASSWORD) : '';
