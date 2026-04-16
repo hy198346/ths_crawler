@@ -175,6 +175,35 @@ function cacheRecTitles(rec) {
     return [];
 }
 
+function ensureStockNameInLine(line, stockName) {
+    const name = cleanOneLine(stockName || '');
+    if (!name) return String(line || '');
+    const parts = String(line || '').split('|');
+    if (!parts || parts.length < 5) return String(line || '');
+    const msg0 = cleanOneLine(parts[3] || '');
+    if (!msg0) return String(line || '');
+    const mFix = /^(\d{4}-\d{2}-\d{2})\s+(.+?)\s+(\d{2}:\d{2}:\d{2})\s+(.*)$/.exec(msg0);
+    if (mFix && cleanOneLine(mFix[2]) === name) {
+        parts[3] = `${mFix[1]} ${mFix[3]} ${name} ${mFix[4]}`;
+        return parts.join('|');
+    }
+    let timePart = '';
+    let rest = '';
+    const mDateTime = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(.*)$/.exec(msg0);
+    if (mDateTime) {
+        timePart = mDateTime[1];
+        rest = mDateTime[2];
+    } else {
+        const m = /^(\S+)\s+(.*)$/.exec(msg0);
+        if (!m) return String(line || '');
+        timePart = m[1];
+        rest = m[2];
+    }
+    if (rest === name || rest.startsWith(`${name} `)) return String(line || '');
+    parts[3] = `${timePart} ${name} ${rest}`;
+    return parts.join('|');
+}
+
 function keysFromAnns(anns) {
     const arr = Array.isArray(anns) ? anns : [];
     const uniq = new Set();
@@ -730,12 +759,13 @@ async function summarizeWithConcurrency(items, limit, fn) {
     return out;
 }
 
-function loadExchangeIdMap() {
+function loadStockMetaMaps() {
     try {
         const raw = fs.readFileSync(STOCK_LIST_PATH, 'utf8');
         const j = JSON.parse(raw);
         const stocks = j && Array.isArray(j.stocks) ? j.stocks : [];
-        const map = new Map();
+        const exchangeMap = new Map();
+        const nameMap = new Map();
         for (const s of stocks) {
             const id = s && s.f12 ? String(s.f12) : '';
             if (!id) continue;
@@ -744,11 +774,13 @@ function loadExchangeIdMap() {
                 : (s && s.f13 !== undefined ? String(s.f13) : '');
             if (id.startsWith('8') || id.startsWith('4') || id.startsWith('9')) ex = '2';
             if (!ex) continue;
-            map.set(id, ex);
+            exchangeMap.set(id, ex);
+            const name = s && s.f14 ? cleanOneLine(String(s.f14)) : '';
+            if (name) nameMap.set(id, name);
         }
-        return map;
+        return { exchangeMap, nameMap };
     } catch {
-        return new Map();
+        return { exchangeMap: new Map(), nameMap: new Map() };
     }
 }
 
@@ -811,7 +843,7 @@ async function main() {
     console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} maxPerStockRange=${ANNOUNCEMENT_MAX_PER_STOCK_RANGE} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
-    const exchangeMap = loadExchangeIdMap();
+    const { exchangeMap, nameMap } = loadStockMetaMaps();
     console.log(`ANN Stock list: path=${STOCK_LIST_PATH} size=${exchangeMap.size}`);
     const today = cninfoDateString(0);
     const yesterday = cninfoDateString(-1);
@@ -823,6 +855,12 @@ async function main() {
     const oldOut = loadExistingOutputLines(ANN_OUTPUT_PATH);
     const mergedOrder = oldOut.order.slice();
     const mergedMap = new Map(oldOut.map);
+    for (const stockId of mergedOrder) {
+        const oldLine = mergedMap.get(stockId);
+        if (!oldLine) continue;
+        const patched = ensureStockNameInLine(oldLine, nameMap.get(stockId) || '');
+        if (patched && patched !== oldLine) mergedMap.set(stockId, patched);
+    }
     let totalAdded = 0;
     let totalUpdated = 0;
     let totalUnchanged = 0;
@@ -933,19 +971,21 @@ async function main() {
 
         const newMap = new Map();
         const newOrder = [];
+        const newStockNameMap = new Map();
         let cnt = 0;
         for (let i = 0; i < annList.length; i += 1) {
             const ann = annList[i];
             const stockId = ann && ann.secCode ? String(ann.secCode) : '';
             if (!stockId) continue;
             const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
-            const stockName = cleanOneLine(ann && ann.secName ? ann.secName : '');
+            const stockName = nameMap.get(stockId) || cleanOneLine(ann && ann.secName ? ann.secName : '');
             const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
             const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
             if (!t || !s) continue;
             const line = `${exchangeId}|${stockId}|22|${t} ${stockName ? `${stockName} ` : ''}${s}|0.000`;
             if (!newMap.has(stockId)) newOrder.push(stockId);
             newMap.set(stockId, line);
+            if (stockName) newStockNameMap.set(stockId, stockName);
             cnt++;
         }
 
@@ -960,6 +1000,8 @@ async function main() {
             if (oldLine) {
                 if (titleHitStocks.has(stockId)) {
                     unchanged += 1;
+                    const patched = ensureStockNameInLine(oldLine, newStockNameMap.get(stockId) || '');
+                    if (patched && patched !== oldLine) mergedMap.set(stockId, patched);
                     continue;
                 }
                 if (oldLine === line) {
