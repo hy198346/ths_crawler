@@ -44,6 +44,10 @@ const ANN_PRINT_UPDATED = ['1', 'true', 'yes', 'on'].includes(String(process.env
 const ANN_PRINT_UPDATED_LIMIT = Number(process.env.ANN_PRINT_UPDATED_LIMIT || 50);
 const ANN_RUN_TIMES = Number(process.env.ANN_RUN_TIMES || 3);
 const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'stock_list.json');
+const STOCK_CODES_PATH = process.env.STOCK_CODES_PATH
+    ? path.resolve(process.env.STOCK_CODES_PATH)
+    : path.join(__dirname, 'stock_codes.txt');
+const ANN_UPDATE_WINDOW_HOURS = Number(process.env.ANN_UPDATE_WINDOW_HOURS || 12);
 
 let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;
@@ -833,6 +837,25 @@ function loadStockMetaMaps() {
     }
 }
 
+function loadStockCodesSet(exchangeMap) {
+    try {
+        if (fs.existsSync(STOCK_CODES_PATH)) {
+            const raw = fs.readFileSync(STOCK_CODES_PATH, 'utf8');
+            const codes = String(raw || '')
+                .split(/\r?\n/g)
+                .map((s) => String(s || '').trim())
+                .filter(Boolean);
+            if (codes.length) return new Set(codes);
+        }
+    } catch {}
+    try {
+        const keys = exchangeMap && typeof exchangeMap.keys === 'function' ? Array.from(exchangeMap.keys()) : [];
+        return new Set(keys);
+    } catch {
+        return new Set();
+    }
+}
+
 function fallbackExchangeId(stockId) {
     const id = String(stockId || '');
     if (id.startsWith('8') || id.startsWith('4') || id.startsWith('9')) return '2';
@@ -893,7 +916,8 @@ async function main() {
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
     const { exchangeMap, nameMap } = loadStockMetaMaps();
-    console.log(`ANN Stock list: path=${STOCK_LIST_PATH} size=${exchangeMap.size}`);
+    const stockCodes = loadStockCodesSet(exchangeMap);
+    console.log(`ANN Stock list: path=${STOCK_LIST_PATH} size=${exchangeMap.size} codes=${stockCodes.size} codesPath=${STOCK_CODES_PATH}`);
     const today = cninfoDateString(0);
     const yesterday = cninfoDateString(-1);
     console.log(`ANN Dates: today=${today} yesterday=${yesterday}`);
@@ -946,9 +970,17 @@ async function main() {
     for (let run = 1; run <= runs; run += 1) {
         console.log(`ANN Run: ${run}/${runs}`);
         const merged = await cninfoPickDayForTodayAndYesterday();
-        const annList = Array.from(merged.values());
-        console.log(`ANN Latest unique stocks: ${annList.length}`);
-        lastAnnListLen = annList.length;
+        const all = Array.from(merged.values()).filter((x) => x && x.secCode && stockCodes.has(String(x.secCode)));
+        const windowHours = Number.isFinite(ANN_UPDATE_WINDOW_HOURS) && ANN_UPDATE_WINDOW_HOURS > 0 ? ANN_UPDATE_WINDOW_HOURS : 0;
+        const nowMs = Date.now();
+        const windowStartMs = windowHours ? nowMs - Math.floor(windowHours * 3600 * 1000) : 0;
+        const annList = windowHours
+            ? all.filter((x) => (Number(x && x.latestEpochMs ? x.latestEpochMs : 0) || 0) >= windowStartMs)
+            : all;
+        console.log(
+            `ANN Latest unique stocks: total=${all.length} selected=${annList.length} windowHours=${windowHours || 'off'}`
+        );
+        lastAnnListLen = all.length;
         let cacheHitCnt = 0;
         const titleHitStocks = new Set();
 

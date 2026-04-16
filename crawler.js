@@ -336,6 +336,20 @@ let tunnelHttpsAgent = null;
 let proxyHttpKeepAliveAgent = null;
 const STOCK_LIST_CACHE_PATH = path.join(__dirname, 'stock_list_cache.json');
 const STOCK_LIST_SAVED_PATH = path.join(__dirname, 'stock_list.json');
+const STOCK_CODE_LIST_PATH = path.join(__dirname, 'stock_codes.txt');
+const CRAWLER_PROGRESS_ONLY = !['0', 'false', 'no', 'off'].includes(
+    String(process.env.CRAWLER_PROGRESS_ONLY || '1').trim().toLowerCase()
+);
+
+function logDetail(msg) {
+    if (CRAWLER_PROGRESS_ONLY) return;
+    console.log(String(msg || ''));
+}
+
+function logErrorDetail(msg) {
+    if (CRAWLER_PROGRESS_ONLY) return;
+    console.error(String(msg || ''));
+}
 
 function resetTunnelAgents() {
     try {
@@ -568,6 +582,14 @@ function saveStockListSaved(stocks) {
             JSON.stringify({ updatedAt: Date.now(), stocks }, null, 2),
             'utf8'
         );
+    } catch {}
+    try {
+        const codes = Array.isArray(stocks)
+            ? stocks
+                  .map((x) => (x && x.f12 != null ? String(x.f12).trim() : ''))
+                  .filter(Boolean)
+            : [];
+        if (codes.length) fs.writeFileSync(STOCK_CODE_LIST_PATH, `${codes.join('\n')}\n`, 'utf8');
     } catch {}
 }
 
@@ -1237,7 +1259,7 @@ async function getStocksByPage(page, retryCount = 0, session) {
             total: data.data.total || 0
         };
     } catch (error) {
-        console.log(`Page ${page} error: ${error.message}`);
+        logDetail(`Page ${page} error: ${error.message}`);
         const statusCode = error && typeof error.statusCode === 'number' ? error.statusCode : null;
         const isBlocked = statusCode === 517 || statusCode === 403 || statusCode === 429 || statusCode === 503;
         if (isBlocked) {
@@ -1248,14 +1270,14 @@ async function getStocksByPage(page, retryCount = 0, session) {
             markTunnelProxyFailure({ resetGlobalAgents: false });
         }
         if (retryCount < MAX_RETRIES) {
-            console.log(`Retrying page ${page} (attempt ${retryCount + 1})...`);
+            logDetail(`Retrying page ${page} (attempt ${retryCount + 1})...`);
             if (RETRY_DELAY > 0) {
                 const delay = RETRY_DELAY + Math.floor(Math.random() * 300);
                 await new Promise((resolve) => setTimeout(resolve, delay));
             }
             return getStocksByPage(page, retryCount + 1, session);
         }
-        console.log(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
+        logDetail(`Failed to fetch page ${page} after ${MAX_RETRIES} attempts`);
         return null;
     }
 }
@@ -1560,7 +1582,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 blocked: hadBlocked
             };
         } catch (error) {
-            console.error(`Stock ${stockId} attempt ${attempt} error: ${error.message}`);
+            logErrorDetail(`Stock ${stockId} attempt ${attempt} error: ${error.message}`);
             const statusCode = error && typeof error.statusCode === 'number' ? error.statusCode : null;
             lastStatusCode = statusCode;
             const isBlocked = statusCode === 517 || statusCode === 403 || statusCode === 429 || statusCode === 503;
@@ -1610,7 +1632,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
         }
     }
     
-    console.error(`Failed to fetch stock ${stockId} after ${MAX_RETRIES} attempts`);
+    logErrorDetail(`Failed to fetch stock ${stockId} after ${MAX_RETRIES} attempts`);
     return {
         ok: false,
         reason: lastReason,

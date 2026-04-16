@@ -174,6 +174,16 @@ function parseAnnouncementFileForLlm() {
   const today = excludeMidnightToday
     ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
     : '';
+  const windowHours = Number(process.env.ANNOUNCE_KIMI_WINDOW_HOURS || 12);
+  const nowMs = Date.now();
+  const windowStartMs = Number.isFinite(windowHours) && windowHours > 0 ? nowMs - Math.floor(windowHours * 3600 * 1000) : 0;
+  const parseShanghaiEpoch = (s) => {
+    const m = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2}):(\d{2})\b/.exec(String(s || '').trim());
+    if (!m) return 0;
+    const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}+08:00`;
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? t : 0;
+  };
   for (const line of lines) {
     const parts = line.split('|');
     if (parts.length < 5) continue;
@@ -183,6 +193,10 @@ function parseAnnouncementFileForLlm() {
     if (excludeMidnightToday) {
       const m = text.match(/^(\d{4}-\d{2}-\d{2})\s+00:00:00\b/);
       if (m && m[1] === today) continue;
+    }
+    if (windowStartMs) {
+      const ts = parseShanghaiEpoch(text);
+      if (!ts || ts < windowStartMs || ts > nowMs + 60000) continue;
     }
     items.push({ stockId, text });
   }
