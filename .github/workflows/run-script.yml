@@ -96,10 +96,10 @@ jobs:
           git add extern_user.txt.gz
           git add extern_user_ann_cache.json
           if [ -f "extern_user_ann.txt" ]; then
-            git add extern_user_ann.txt
+            git add -f extern_user_ann.txt
           fi
           if [ -f "extern_user_kimi_digest.md" ]; then
-            git add extern_user_kimi_digest.md
+            git add -f extern_user_kimi_digest.md
           fi
           git add package-lock.json
           
