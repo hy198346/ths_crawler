@@ -325,6 +325,25 @@ function getLlmAlertSummaryForNotice(stdout, stderr) {
   return out.join('\n');
 }
 
+function parseAnnMergeStatsFromStdout(stdout) {
+  const text = String(stdout || '');
+  const re = /total\s*=\s*(\d+)[^\d]+new\s*=\s*(\d+)[^\d]+updated\s*=\s*(\d+)[^\d]+unchanged\s*=\s*(\d+)/g;
+  let last = null;
+  for (;;) {
+    const m = re.exec(text);
+    if (!m) break;
+    last = {
+      total: Number(m[1]),
+      added: Number(m[2]),
+      updated: Number(m[3]),
+      unchanged: Number(m[4])
+    };
+  }
+  if (!last) return null;
+  if (![last.total, last.added, last.updated, last.unchanged].every((n) => Number.isFinite(n) && n >= 0)) return null;
+  return last;
+}
+
 // 发送消息到Server酱的函数
 function buildServerChanRequest(message, key) {
   const body = new URLSearchParams({
@@ -433,7 +452,12 @@ function runCrawler() {
           const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
           const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
           const llmAlertSummary = getLlmAlertSummaryForNotice(stdout, stderr);
-          const kimiDigest = await getAnnouncementDigestByKimi();
+          const annMerge = parseAnnMergeStatsFromStdout(stdout);
+          const shouldSkipKimi = annMerge && annMerge.added === 0 && annMerge.updated === 0;
+          if (shouldSkipKimi) {
+            console.log(`Kimi精选跳过：公告无新增/更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
+          }
+          const kimiDigest = shouldSkipKimi ? '' : await getAnnouncementDigestByKimi();
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const successMessage = [
