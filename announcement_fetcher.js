@@ -939,10 +939,11 @@ async function main() {
             const stockId = ann && ann.secCode ? String(ann.secCode) : '';
             if (!stockId) continue;
             const exchangeId = exchangeMap.get(stockId) || fallbackExchangeId(stockId);
+            const stockName = cleanOneLine(ann && ann.secName ? ann.secName : '');
             const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
             const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
             if (!t || !s) continue;
-            const line = `${exchangeId}|${stockId}|22|${t} ${s}|0.000`;
+            const line = `${exchangeId}|${stockId}|22|${t} ${stockName ? `${stockName} ` : ''}${s}|0.000`;
             if (!newMap.has(stockId)) newOrder.push(stockId);
             newMap.set(stockId, line);
             cnt++;
