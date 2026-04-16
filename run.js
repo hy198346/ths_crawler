@@ -521,7 +521,15 @@ function runCrawler() {
             console.log(`Kimi精选跳过：公告无新增/更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
           }
           const cachedKimi = loadKimiDigestCache();
-          const kimiDigest = shouldSkipKimi ? cachedKimi : (await getAnnouncementDigestByKimi()) || cachedKimi;
+          let kimiDigest = '';
+          if (shouldSkipKimi) {
+            kimiDigest = cachedKimi;
+            if (!kimiDigest) {
+              kimiDigest = (await getAnnouncementDigestByKimi()) || '';
+            }
+          } else {
+            kimiDigest = (await getAnnouncementDigestByKimi()) || cachedKimi;
+          }
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const successMessage = [
