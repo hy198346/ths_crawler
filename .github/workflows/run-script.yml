@@ -51,7 +51,7 @@ jobs:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }} # 关键步骤
           ANN_USE_TUNNEL_PROXY: '0'
           ANN_UPDATE_WINDOW_HOURS: '0'
-          ANN_LOOKBACK_DAYS: '4'
+          ANN_LOOKBACK_DAYS: '1'
           ANN_RUN_TIMES: '3'
           CNINFO_PLATES: 'all'
           CNINFO_MAX_PAGES: '300'
