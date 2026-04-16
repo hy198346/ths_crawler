@@ -36,6 +36,9 @@ const ANN_USE_TUNNEL_PROXY = ['1', 'true', 'yes', 'on'].includes(String(process.
 const ANN_TIME_FORMAT = String(process.env.ANN_TIME_FORMAT || '').trim().toLowerCase();
 const ANN_DECIMAL_DIGITS = Number(process.env.ANN_DECIMAL_DIGITS || 2);
 const ANN_OUTPUT_PATH = process.env.ANN_OUTPUT_PATH || path.join(__dirname, 'extern_user_ann.txt');
+const ANN_SUMMARY_CACHE_PATH = process.env.ANN_SUMMARY_CACHE_PATH || path.join(__dirname, 'extern_user_ann_cache.json');
+const ANN_PRINT_UPDATED = ['1', 'true', 'yes', 'on'].includes(String(process.env.ANN_PRINT_UPDATED || '').trim().toLowerCase());
+const ANN_PRINT_UPDATED_LIMIT = Number(process.env.ANN_PRINT_UPDATED_LIMIT || 50);
 const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'stock_list.json');
 
 let tunnelHttpsAgent = null;
@@ -97,6 +100,88 @@ function cninfoDateString(offsetDays = 0) {
 
 function cleanOneLine(s) {
     return String(s || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function annStableKey(a) {
+    const id = a && a.announcementId ? String(a.announcementId) : '';
+    if (id) return `id:${id}`;
+    const epochMs = Number(a && a.epochMs ? a.epochMs : 0) || 0;
+    const adjunctUrl = a && a.adjunctUrl ? String(a.adjunctUrl) : '';
+    const title = cleanOneLine(a && a.title ? a.title : '');
+    return `k:${epochMs}|${adjunctUrl}|${title}`;
+}
+
+function buildCacheKey(anns) {
+    const arr = Array.isArray(anns) ? anns : [];
+    const parts = arr.map((a) => annStableKey(a)).filter(Boolean);
+    parts.sort();
+    return `n:${parts.length}|${parts.join(',')}`;
+}
+
+function buildTitleKey(anns) {
+    const arr = Array.isArray(anns) ? anns : [];
+    const uniq = new Set();
+    for (const a of arr) {
+        const t = cleanOneLine(a && a.title ? a.title : '');
+        if (t) uniq.add(t);
+    }
+    const titles = Array.from(uniq);
+    titles.sort();
+    return `n:${titles.length}|${titles.join('；')}`;
+}
+
+function normalizeTitleKey(s) {
+    const raw = cleanOneLine(s || '');
+    if (!raw) return '';
+    const tail = raw.startsWith('n:') ? raw.slice(2) : raw;
+    const pipe = tail.indexOf('|');
+    const titlesPart = pipe >= 0 ? tail.slice(pipe + 1) : tail;
+    const parts = String(titlesPart || '')
+        .split('；')
+        .map((x) => cleanOneLine(x))
+        .filter(Boolean);
+    const uniq = Array.from(new Set(parts));
+    uniq.sort();
+    return `n:${uniq.length}|${uniq.join('；')}`;
+}
+
+function titleKeyToList(s) {
+    const norm = normalizeTitleKey(s || '');
+    if (!norm) return [];
+    const i = norm.indexOf('|');
+    if (i < 0) return [];
+    return String(norm.slice(i + 1) || '')
+        .split('；')
+        .map((x) => cleanOneLine(x))
+        .filter(Boolean);
+}
+
+function titlesFromAnns(anns) {
+    const arr = Array.isArray(anns) ? anns : [];
+    const uniq = new Set();
+    for (const a of arr) {
+        const t = cleanOneLine(a && a.title ? a.title : '');
+        if (t) uniq.add(t);
+    }
+    return Array.from(uniq);
+}
+
+function cacheRecTitles(rec) {
+    if (!rec || typeof rec !== 'object') return [];
+    const arr = Array.isArray(rec.titles) ? rec.titles : null;
+    if (arr) return arr.map((x) => cleanOneLine(x)).filter(Boolean);
+    if (rec.t) return titleKeyToList(rec.t);
+    return [];
+}
+
+function keysFromAnns(anns) {
+    const arr = Array.isArray(anns) ? anns : [];
+    const uniq = new Set();
+    for (const a of arr) {
+        const k = annStableKey(a);
+        if (k) uniq.add(k);
+    }
+    return Array.from(uniq);
 }
 
 function cutByChars(s, maxChars) {
@@ -377,16 +462,19 @@ async function cninfoDailyByStock(dateStr) {
             console.log(`ANN CNINFO items: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length}`);
             let addedNewStock = 0;
             let addedNewAnn = 0;
+            let newAnnOnPage = 0;
             for (const item of items) {
                 const secCode = String(item.secCode || item.sec_code || '').trim();
                 if (!secCode) continue;
                 const announcementId = String(item.announcementId || item.announcement_id || '').trim();
-                if (announcementId && seenAnn.has(announcementId)) continue;
-                if (announcementId) seenAnn.add(announcementId);
                 const epochMs = cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0;
                 const title = String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
                 const adjunctUrl = String(item.adjunctUrl || item.adjunct_url || '').trim();
                 const timeStr = formatCninfoTime(item.announcementTime || item.announcement_time || '');
+                const seenKey = announcementId ? `id:${announcementId}` : `k:${secCode}|${epochMs}|${adjunctUrl}|${title}`;
+                if (seenAnn.has(seenKey)) continue;
+                seenAnn.add(seenKey);
+                newAnnOnPage += 1;
                 let entry = out.get(secCode);
                 if (!entry) {
                     entry = {
@@ -399,23 +487,21 @@ async function cninfoDailyByStock(dateStr) {
                     out.set(secCode, entry);
                     addedNewStock++;
                 }
-                if (entry.announcements.length < ANNOUNCEMENT_MAX_PER_STOCK_DAY) {
-                    entry.announcements.push({
-                        announcementId,
-                        title,
-                        time: timeStr,
-                        epochMs,
-                        adjunctUrl
-                    });
-                    addedNewAnn++;
-                }
+                entry.announcements.push({
+                    announcementId,
+                    title,
+                    time: timeStr,
+                    epochMs,
+                    adjunctUrl
+                });
+                addedNewAnn++;
                 if (epochMs > (entry.latestEpochMs || 0)) {
                     entry.latestEpochMs = epochMs;
                     entry.latestTime = timeStr;
                 }
             }
             console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
-            if (addedNewStock === 0 && addedNewAnn === 0) {
+            if (newAnnOnPage === 0) {
                 stallCount += 1;
             } else {
                 stallCount = 0;
@@ -424,6 +510,36 @@ async function cninfoDailyByStock(dateStr) {
                 console.log(`ANN CNINFO stop on stall: plate=${plate || 'na'} col=${column} date=${dateStr} stallPages=${stallCount}`);
                 break;
             }
+            if (items.length < pageSize) {
+                console.log(`ANN CNINFO stop on tail: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length} pageSize=${pageSize}`);
+                break;
+            }
+        }
+    }
+    for (const v of out.values()) {
+        const anns = Array.isArray(v.announcements) ? v.announcements : [];
+        anns.sort((a, b) => {
+            const ea = Number(a && a.epochMs ? a.epochMs : 0) || 0;
+            const eb = Number(b && b.epochMs ? b.epochMs : 0) || 0;
+            if (eb !== ea) return eb - ea;
+            const ia = a && a.announcementId ? String(a.announcementId) : '';
+            const ib = b && b.announcementId ? String(b.announcementId) : '';
+            if (ib !== ia) return ib > ia ? 1 : -1;
+            const ta = cleanOneLine(a && a.title ? a.title : '');
+            const tb = cleanOneLine(b && b.title ? b.title : '');
+            if (tb !== ta) return tb > ta ? 1 : -1;
+            const ua = a && a.adjunctUrl ? String(a.adjunctUrl) : '';
+            const ub = b && b.adjunctUrl ? String(b.adjunctUrl) : '';
+            if (ub !== ua) return ub > ua ? 1 : -1;
+            return 0;
+        });
+        v.announcements = anns;
+        if (anns.length) {
+            const top = anns[0];
+            const topEpoch = Number(top && top.epochMs ? top.epochMs : 0) || 0;
+            const topTime = String(top && top.time ? top.time : '');
+            if (topEpoch > (v.latestEpochMs || 0)) v.latestEpochMs = topEpoch;
+            if (topTime && !v.latestTime) v.latestTime = topTime;
         }
     }
     return out;
@@ -449,16 +565,29 @@ async function cninfoPickDayForTodayAndYesterday() {
         const seen = new Set();
         for (const a of combined) {
             const id = a && a.announcementId ? String(a.announcementId) : '';
-            const key = id ? `id:${id}` : `t:${String(a && a.time ? a.time : '')}|${String(a && a.title ? a.title : '')}`;
+            const key = id
+                ? `id:${id}`
+                : `t:${String(a && a.time ? a.time : '')}|${String(a && a.title ? a.title : '')}|${String(a && a.adjunctUrl ? a.adjunctUrl : '')}`;
             if (seen.has(key)) continue;
             seen.add(key);
             uniq.push(a);
         }
-        uniq.sort((a, b) => (Number(b && b.epochMs ? b.epochMs : 0) || 0) - (Number(a && a.epochMs ? a.epochMs : 0) || 0));
-        const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
-            ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
-            : 0;
-        cur.announcements = cap ? uniq.slice(0, cap) : uniq;
+        uniq.sort((a, b) => {
+            const ea = Number(a && a.epochMs ? a.epochMs : 0) || 0;
+            const eb = Number(b && b.epochMs ? b.epochMs : 0) || 0;
+            if (eb !== ea) return eb - ea;
+            const ia = a && a.announcementId ? String(a.announcementId) : '';
+            const ib = b && b.announcementId ? String(b.announcementId) : '';
+            if (ib !== ia) return ib > ia ? 1 : -1;
+            const ta = cleanOneLine(a && a.title ? a.title : '');
+            const tb = cleanOneLine(b && b.title ? b.title : '');
+            if (tb !== ta) return tb > ta ? 1 : -1;
+            const ua = a && a.adjunctUrl ? String(a.adjunctUrl) : '';
+            const ub = b && b.adjunctUrl ? String(b.adjunctUrl) : '';
+            if (ub !== ua) return ub > ua ? 1 : -1;
+            return 0;
+        });
+        cur.announcements = uniq;
         if ((v.latestEpochMs || 0) > (cur.latestEpochMs || 0)) {
             cur.latestEpochMs = v.latestEpochMs || 0;
             cur.latestTime = v.latestTime || '';
@@ -629,6 +758,49 @@ function fallbackExchangeId(stockId) {
     return '0';
 }
 
+function loadExistingOutputLines(filePath) {
+    try {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const lines = String(raw || '')
+            .split(/\r?\n/g)
+            .map((s) => String(s || '').trim())
+            .filter(Boolean);
+        const order = [];
+        const map = new Map();
+        const extra = [];
+        for (const line of lines) {
+            const parts = String(line || '').split('|');
+            const stockId = parts && parts.length >= 2 ? String(parts[1] || '').trim() : '';
+            if (!stockId) {
+                extra.push(line);
+                continue;
+            }
+            if (!map.has(stockId)) order.push(stockId);
+            map.set(stockId, line);
+        }
+        return { order, map, extra };
+    } catch {
+        return { order: [], map: new Map(), extra: [] };
+    }
+}
+
+function loadSummaryCache(filePath) {
+    try {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const j = JSON.parse(String(raw || ''));
+        if (!j || typeof j !== 'object') return {};
+        return j;
+    } catch {
+        return {};
+    }
+}
+
+function saveSummaryCache(filePath, cacheObj) {
+    try {
+        fs.writeFileSync(filePath, JSON.stringify(cacheObj || {}, null, 2) + '\n', 'utf8');
+    } catch {}
+}
+
 async function main() {
     console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
     console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
@@ -646,6 +818,9 @@ async function main() {
     const merged = await cninfoPickDayForTodayAndYesterday();
     const annList = Array.from(merged.values());
     console.log(`ANN Latest unique stocks: ${annList.length}`);
+    const summaryCache = loadSummaryCache(ANN_SUMMARY_CACHE_PATH);
+    let cacheHitCnt = 0;
+    const titleHitStocks = new Set();
     if (LLM_API_KEY && !pdfParse && !llmPdfParserMissingNoted) {
         llmPdfParserMissingNoted = true;
         addLlmErrorLine('pdf-parse 不可用，LLM 输入将退化为标题文本，无法通读公告正文。');
@@ -658,18 +833,53 @@ async function main() {
             const secCode = entry && entry.secCode ? String(entry.secCode) : '';
             const secName = entry && entry.secName ? String(entry.secName) : '';
             const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
-            const anns = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+            const annsAll = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
+            const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0
+                ? Math.floor(ANNOUNCEMENT_MAX_PER_STOCK_RANGE)
+                : 0;
+            const anns = cap ? annsAll.slice(0, cap) : annsAll;
             llmDebugLog(`ANN Summarize: sec=${secCode || ''} anns=${anns.length} pdf=${LLM_API_KEY && pdfParse ? 'on' : 'off'}`);
             const titles = anns.map((a) => cleanOneLine(a.title || '')).filter(Boolean);
             const titleJoined = titles.join('；');
 
             const payloadTitle = titleJoined || (titles[0] || '');
+            const cacheRec = secCode && summaryCache && summaryCache[secCode] ? summaryCache[secCode] : null;
+            const cachedTitles = cacheRecTitles(cacheRec);
+            const cachedSet = new Set(cachedTitles);
+            const currentAllTitles = titlesFromAnns(annsAll);
+            const currentAllKeys = keysFromAnns(annsAll);
+            const cachedKeys = cacheRec && Array.isArray(cacheRec.keys) ? cacheRec.keys.map((x) => String(x || '')) : [];
+            const cachedKeySet = new Set(cachedKeys);
+            const missingKeys = currentAllKeys.filter((k) => !cachedKeySet.has(k));
+            const missingTitles = currentAllTitles.filter((t) => !cachedSet.has(t));
+            const isOld = currentAllKeys.length ? missingKeys.length === 0 : missingTitles.length === 0;
+            if (cacheRec && cacheRec.s && isOld) {
+                cacheHitCnt += 1;
+                if (secCode) titleHitStocks.add(secCode);
+                summaryCache[secCode] = {
+                    ...cacheRec,
+                    keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
+                    titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
+                    ts: Date.now()
+                };
+                return String(cacheRec.s);
+            }
             if (!LLM_API_KEY || !pdfParse) {
-                return llmSummarizeAnnouncement(
+                const out = await llmSummarizeAnnouncement(
                     { secCode, secName, announcementTime, announcementTitle: payloadTitle },
                     ANNOUNCEMENT_SUMMARY_CHARS,
                     payloadTitle
                 );
+                if (secCode && out) {
+                    summaryCache[secCode] = {
+                        ...cacheRec,
+                        keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
+                        titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
+                        s: out,
+                        ts: Date.now()
+                    };
+                }
+                return out;
             }
 
             const pdfTexts = await summarizeWithConcurrency(
@@ -686,14 +896,26 @@ async function main() {
                 bodyBlocks.push(`【${t}】${body}`);
             }
             const payloadText = bodyBlocks.length ? bodyBlocks.join(' ') : payloadTitle;
-            return llmSummarizeAnnouncement(
+            const out = await llmSummarizeAnnouncement(
                 { secCode, secName, announcementTime, announcementTitle: payloadTitle },
                 ANNOUNCEMENT_SUMMARY_CHARS,
                 payloadText
             );
+            if (secCode && out) {
+                summaryCache[secCode] = {
+                    ...cacheRec,
+                    keys: Array.from(new Set(cachedKeys.concat(currentAllKeys))).sort(),
+                    titles: Array.from(new Set(cachedTitles.concat(currentAllTitles))).sort(),
+                    s: out,
+                    ts: Date.now()
+                };
+            }
+            return out;
         }
     );
-    const lines = [];
+    const oldOut = loadExistingOutputLines(ANN_OUTPUT_PATH);
+    const newMap = new Map();
+    const newOrder = [];
     let cnt = 0;
     for (let i = 0; i < annList.length; i += 1) {
         const ann = annList[i];
@@ -703,11 +925,46 @@ async function main() {
         const t = formatAnnTime(cleanOneLine(ann.latestTime || ''));
         const s = formatDecimalsInText(cleanOneLine(summaries[i] || ''));
         if (!t || !s) continue;
-        lines.push(`${exchangeId}|${stockId}|22|${t} ${s}|0.000`);
+        const line = `${exchangeId}|${stockId}|22|${t} ${s}|0.000`;
+        if (!newMap.has(stockId)) newOrder.push(stockId);
+        newMap.set(stockId, line);
         cnt++;
     }
+    const mergedOrder = oldOut.order.slice();
+    const mergedMap = new Map(oldOut.map);
+    let updated = 0;
+    let added = 0;
+    let unchanged = 0;
+    let updatedPrinted = 0;
+    for (const stockId of newOrder) {
+        const line = newMap.get(stockId);
+        if (!line) continue;
+        const oldLine = mergedMap.get(stockId);
+        if (oldLine) {
+            if (titleHitStocks.has(stockId)) {
+                unchanged += 1;
+                continue;
+            }
+            if (oldLine === line) {
+                unchanged += 1;
+                continue;
+            }
+            updated += 1;
+            if (ANN_PRINT_UPDATED && updatedPrinted < (Number.isFinite(ANN_PRINT_UPDATED_LIMIT) && ANN_PRINT_UPDATED_LIMIT > 0 ? Math.floor(ANN_PRINT_UPDATED_LIMIT) : 0)) {
+                updatedPrinted += 1;
+                console.log(`ANN Updated: ${stockId} old="${oldLine}" new="${line}"`);
+            }
+        } else {
+            mergedOrder.push(stockId);
+            added += 1;
+        }
+        mergedMap.set(stockId, line);
+    }
+    const lines = mergedOrder.map((k) => mergedMap.get(k)).filter(Boolean).concat(oldOut.extra);
     fs.writeFileSync(ANN_OUTPUT_PATH, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
-    console.log(`公告家数: ${cnt}`);
+    console.log(`公告家数: ${cnt} 合并: total=${lines.length} new=${added} updated=${updated} unchanged=${unchanged}`);
+    saveSummaryCache(ANN_SUMMARY_CACHE_PATH, summaryCache);
+    if (cacheHitCnt > 0) console.log(`ANN Cache hit: ${cacheHitCnt}`);
     const llmAbnormal = !LLM_API_KEY || llmFailCnt > 0 || llmErrorLines.length > 0 || (annList.length > 0 && llmUsedCnt === 0);
     if (llmAbnormal) {
         console.warn(`ANN LLM ALERT: used=${llmUsedCnt} fail=${llmFailCnt} fallback=${llmFallbackCnt} sameAsTitle=${llmSameAsTitleCnt}`);
