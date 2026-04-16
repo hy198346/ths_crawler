@@ -244,7 +244,7 @@ async function getAnnouncementDigestByKimi() {
   }
   if (!parsed || !parsed.count) return '';
 
-  const topN = Number(process.env.ANNOUNCE_KIMI_TOP_N || 10);
+  const topN = Number(process.env.ANNOUNCE_KIMI_TOP_N || 30);
   const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
   const maxInChars = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_CHARS || 120000);
   const safeTopN = Number.isFinite(topN) && topN > 0 ? Math.floor(topN) : 10;
