@@ -47,7 +47,7 @@ const STOCK_LIST_PATH = process.env.STOCK_LIST_PATH || path.join(__dirname, 'sto
 const STOCK_CODES_PATH = process.env.STOCK_CODES_PATH
     ? path.resolve(process.env.STOCK_CODES_PATH)
     : path.join(__dirname, 'stock_codes.txt');
-const ANN_UPDATE_WINDOW_HOURS = Number(process.env.ANN_UPDATE_WINDOW_HOURS || 12);
+const ANN_UPDATE_WINDOW_HOURS = Number(process.env.ANN_UPDATE_WINDOW_HOURS || 0);
 
 let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;

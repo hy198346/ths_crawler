@@ -50,6 +50,7 @@ jobs:
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }} # 关键步骤
           ANN_USE_TUNNEL_PROXY: '0'
+          ANN_UPDATE_WINDOW_HOURS: '0'
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           ANNOUNCEMENT_SUMMARY_CHARS: ${{ secrets.ANNOUNCEMENT_SUMMARY_CHARS }}
           KIMI_DEBUG: ${{ secrets.KIMI_DEBUG }}
