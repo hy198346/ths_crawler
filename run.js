@@ -326,20 +326,33 @@ function getLlmAlertSummaryForNotice(stdout, stderr) {
 }
 
 // 发送消息到Server酱的函数
+function buildServerChanRequest(message, key) {
+  const body = new URLSearchParams({
+    title: '同花顺概念更新成功',
+    desp: String(message || '')
+  }).toString();
+
+  const options = {
+    hostname: 'sctapi.ftqq.com',
+    path: `/${key}.send`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body),
+      'Accept-Encoding': 'identity'
+    }
+  };
+
+  return { options, body };
+}
+
 function sendServerChan(message) {
   if (!SERVERCHAN_KEY) {
     console.warn('未设置SERVERCHAN_KEY，跳过Server酱通知');
     return Promise.resolve(false);
   }
 
-  const title = encodeURIComponent('同花顺概念更新成功');
-  const desp = encodeURIComponent(message);
-
-  const options = {
-    hostname: 'sctapi.ftqq.com',
-    path: `/${SERVERCHAN_KEY}.send?title=${title}&desp=${desp}`,
-    method: 'GET'
-  };
+  const { options, body } = buildServerChanRequest(message, SERVERCHAN_KEY);
 
   return new Promise((resolve) => {
     const req = https.request(options, (res) => {
@@ -372,6 +385,7 @@ function sendServerChan(message) {
       resolve(false);
     });
 
+    req.write(body);
     req.end();
   });
 }
@@ -492,7 +506,8 @@ function runCrawler() {
 
 module.exports = {
   loadStockNameMap,
-  injectStockNamesIntoKimiSection
+  injectStockNamesIntoKimiSection,
+  buildServerChanRequest
 };
 
 if (require.main === module) {
