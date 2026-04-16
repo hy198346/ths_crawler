@@ -1,4 +1,4 @@
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -21,6 +21,13 @@ let tunnelHttpsAgent = null;
 
 function cleanOneLine(s) {
   return String(s || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function appendTail(cur, chunk, maxChars) {
+  const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
+  const next = `${String(cur || '')}${String(chunk || '')}`;
+  if (!cap) return next;
+  return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
 function cutByChars(s, maxChars) {
@@ -416,12 +423,39 @@ function runCrawler() {
   
   console.log(`${logPrefix} 开始执行爬虫 (${startTime.toLocaleTimeString()})...`);
   
-  const child = exec(
-    'node runner.js',
-    { timeout: EXEC_TIMEOUT },
-    (error, stdout, stderr) => {
-      const endTime = new Date();
-      const elapsed = ((endTime - startTime) / 1000).toFixed(1);
+  const captureMaxChars = Number(process.env.RUNNER_CAPTURE_MAX_CHARS || 2000000);
+  let stdout = '';
+  let stderr = '';
+  let killed = false;
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, 'runner.js')],
+    { cwd: __dirname, env: process.env, windowsHide: true }
+  );
+  const killTimer = setTimeout(() => {
+    killed = true;
+    try {
+      child.kill();
+    } catch {}
+  }, EXEC_TIMEOUT);
+
+  child.stdout.on('data', (data) => {
+    const s = String(data || '');
+    stdout = appendTail(stdout, s, captureMaxChars);
+    process.stdout.write(`${logPrefix} STDOUT > ${s}`);
+  });
+  child.stderr.on('data', (data) => {
+    const s = String(data || '');
+    stderr = appendTail(stderr, s, captureMaxChars);
+    process.stderr.write(`${logPrefix} STDERR > ${s}`);
+  });
+
+  child.on('close', (code) => {
+    clearTimeout(killTimer);
+    const error = killed || code ? new Error(killed ? 'Timeout' : `Exit code: ${code}`) : null;
+    if (error && killed) error.killed = true;
+    const endTime = new Date();
+    const elapsed = ((endTime - startTime) / 1000).toFixed(1);
       
       // 记录执行结果
       console.log(`${logPrefix} 执行完成 (耗时: ${elapsed}秒)`);
@@ -516,15 +550,6 @@ function runCrawler() {
           process.exit(1);
         });
       }
-    }
-  );
-
-  // 实时输出（可选）
-  child.stdout.on('data', data => {
-    process.stdout.write(`${logPrefix} STDOUT > ${data}`);
-  });
-  child.stderr.on('data', data => {
-    process.stderr.write(`${logPrefix} STDERR > ${data}`);
   });
 }
 

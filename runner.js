@@ -19,11 +19,16 @@ function runNode(script, envOverrides = {}) {
                 maxBuffer: 64 * 1024 * 1024
             },
             (error, stdout, stderr) => {
+                const errMsg = error && error.message ? String(error.message) : (error ? String(error) : '');
+                let mergedStderr = String(stderr || '');
+                if (errMsg && !mergedStderr.includes(errMsg)) {
+                    mergedStderr = `${mergedStderr}${mergedStderr ? '\n' : ''}${errMsg}\n`;
+                }
                 resolve({
                     ok: !error,
                     code: error && typeof error.code === 'number' ? error.code : 0,
                     stdout: String(stdout || ''),
-                    stderr: String(stderr || '')
+                    stderr: mergedStderr
                 });
             }
         );
@@ -101,12 +106,13 @@ async function main() {
     console.log(`Runner thsTmpBytes: ${thsBuf.length}`);
 
     let annText = '';
-    if (fs.existsSync(ANN_TMP_PATH) && ann.ok) {
+    if (fs.existsSync(ANN_TMP_PATH)) {
         annText = fs.readFileSync(ANN_TMP_PATH, 'utf8');
     }
     console.log(`Runner annTmpChars: ${annText.length}`);
 
-    const combined = `${thsText}${annText}`;
+    const needSep = Boolean(annText) && Boolean(thsText) && !thsText.endsWith('\n');
+    const combined = `${thsText}${needSep ? '\n' : ''}${annText}`;
     const outBuf = iconv.encode(combined, 'GBK');
 
     try {

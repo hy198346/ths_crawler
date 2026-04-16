@@ -1,8 +1,14 @@
 name: Execute JSON Script
+concurrency:
+  group: ths-crawler-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - extern_user.txt.gz
+      - extern_user_ann_cache.json
   pull_request:
     branches:
       - main
@@ -36,7 +42,7 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Run JavaScript script
         env:
