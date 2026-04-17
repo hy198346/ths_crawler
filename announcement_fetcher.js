@@ -50,7 +50,7 @@ const STOCK_CODES_PATH = process.env.STOCK_CODES_PATH
     ? path.resolve(process.env.STOCK_CODES_PATH)
     : path.join(__dirname, 'stock_codes.txt');
 const ANN_UPDATE_WINDOW_HOURS = Number(process.env.ANN_UPDATE_WINDOW_HOURS || 0);
-const ANN_LOOKBACK_DAYS = Number(process.env.ANN_LOOKBACK_DAYS || 2);
+const ANN_LOOKBACK_DAYS = Number(process.env.ANN_LOOKBACK_DAYS || 1);
 
 let tunnelHttpsAgent = null;
 let tunnelHttpAgent = null;
@@ -512,13 +512,14 @@ async function cninfoQuery({ seDate, pageNum, pageSize, column, plate, category 
 }
 
 async function cninfoDailyByStock(dateStr) {
-    const seDate = `${dateStr}~${dateStr}`;
     const out = new Map();
     const seenAnn = new Set();
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
     const pageSize = Number.isFinite(CNINFO_PAGE_SIZE) && CNINFO_PAGE_SIZE > 0 ? CNINFO_PAGE_SIZE : 50;
     const stallLimit = Number.isFinite(CNINFO_STALL_PAGES) && CNINFO_STALL_PAGES > 0 ? Math.floor(CNINFO_STALL_PAGES) : 0;
     const queries = Array.isArray(CNINFO_QUERIES) && CNINFO_QUERIES.length ? CNINFO_QUERIES : [{ plate: 'sz', column: 'szse' }];
+    const targetDayStart = dateStr ? new Date(dateStr + 'T00:00:00+08:00').getTime() : 0;
+    const targetDayEnd = targetDayStart > 0 ? targetDayStart + 86400000 - 1 : 0;
 
     for (const q of queries) {
         const plate = q && q.plate !== undefined ? String(q.plate) : '';
@@ -529,7 +530,7 @@ async function cninfoDailyByStock(dateStr) {
         for (let page = 1; page <= maxPages; page += 1) {
             let j;
             try {
-                j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate, category });
+                j = await cninfoQuery({ seDate: '', pageNum: page, pageSize, column, plate, category });
             } catch (e) {
                 cninfoFailCnt++;
                 console.warn(`ANN query failed: plate=${plate || 'na'} page=${page} err=${e && e.message ? e.message : String(e)}`);
@@ -561,6 +562,7 @@ async function cninfoDailyByStock(dateStr) {
                 if (!secCode) continue;
                 const announcementId = String(item.announcementId || item.announcement_id || '').trim();
                 const epochMs = cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0;
+                if (targetDayStart > 0 && (epochMs < targetDayStart || epochMs > targetDayEnd)) continue;
                 const title = String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
                 const adjunctUrl = String(item.adjunctUrl || item.adjunct_url || '').trim();
                 const timeStr = formatCninfoTime(item.announcementTime || item.announcement_time || '');
@@ -669,8 +671,30 @@ function cninfoMergeStockEntry(cur, next) {
 
 async function cninfoPickDays(lookbackDays) {
     const d = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
-    const days = Math.min(Math.max(d, 1), 14);
     const merged = new Map();
+    if (d === 1) {
+        const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
+        const hhmm = Number(nowBJ.toISOString().slice(11, 16).replace(':', ''));
+        let daysToFetch;
+        if (hhmm < 915) {
+            daysToFetch = [-1, 0];
+        } else if (hhmm >= 1500) {
+            daysToFetch = [0, 1];
+        } else {
+            daysToFetch = [0];
+        }
+        for (const off of daysToFetch) {
+            const day = cninfoDateString(off);
+            const dayMap = await cninfoDailyByStock(day);
+            for (const [k, v] of dayMap.entries()) {
+                const cur = merged.get(k);
+                if (!cur) merged.set(k, v);
+                else merged.set(k, cninfoMergeStockEntry(cur, v));
+            }
+        }
+        return merged;
+    }
+    const days = Math.min(Math.max(d, 1), 14);
     for (let off = 0; off >= -(days - 1); off -= 1) {
         const day = cninfoDateString(off);
         const dayMap = await cninfoDailyByStock(day);
