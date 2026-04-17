@@ -56,9 +56,12 @@ jobs:
           CNINFO_PLATES: 'all'
           CNINFO_MAX_PAGES: '300'
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          ANNOUNCEMENT_SUMMARY_CHARS: ${{ secrets.ANNOUNCEMENT_SUMMARY_CHARS }}
-          KIMI_DEBUG: ${{ secrets.KIMI_DEBUG }}
-          ANNOUNCE_KIMI_TOP_N: ${{ secrets.ANNOUNCE_KIMI_TOP_N }}
+          ANNOUNCEMENT_SUMMARY_CHARS: ${{ vars.ANNOUNCEMENT_SUMMARY_CHARS }}
+          KIMI_DEBUG: ${{ vars.KIMI_DEBUG }}
+          ANNOUNCE_KIMI_TOP_N: ${{ vars.ANNOUNCE_KIMI_TOP_N }}
+          EMAIL_MONITOR_ADDR: ${{ secrets.EMAIL_MONITOR_ADDR }}
+          EMAIL_MONITOR_AUTH: ${{ secrets.EMAIL_MONITOR_AUTH }}
+          EMAIL_MONITOR_WEBHOOK_KEY: ${{ secrets.EMAIL_MONITOR_WEBHOOK_KEY }}
           
         run: |
           echo "当前工作目录: $(pwd)"
