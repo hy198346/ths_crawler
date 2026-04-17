@@ -62,17 +62,21 @@ function maskSecret(s, { keepStart = 0, keepEnd = 4 } = {}) {
 }
 
 function parseLlmUsageFromResponse(j) {
-  const u = j && typeof j === 'object' ? j.usage : null;
-  const pt = u && u.prompt_tokens != null ? Number(u.prompt_tokens) : NaN;
-  const ct = u && u.completion_tokens != null ? Number(u.completion_tokens) : NaN;
-  const tt = u && u.total_tokens != null ? Number(u.total_tokens) : NaN;
-  if (![pt, ct].every((n) => Number.isFinite(n) && n >= 0)) return null;
+  if (!j || typeof j !== 'object') return null;
+  const u = j.usage;
+  if (!u) return null;
+  const pt = u.prompt_tokens != null ? Number(u.prompt_tokens) : NaN;
+  const ct = u.completion_tokens != null ? Number(u.completion_tokens) : NaN;
+  const tt = u.total_tokens != null ? Number(u.total_tokens) : NaN;
+  const ptOk = pt === 0 || Number.isFinite(pt);
+  const ctOk = ct === 0 || Number.isFinite(ct);
+  if (!ptOk || !ctOk) return null;
   const total = Number.isFinite(tt) && tt >= 0 ? tt : pt + ct;
   return { prompt: pt, completion: ct, total };
 }
 
 function addLlmUsageToAcc(usage) {
-  if (!usage) return;
+  if (!usage) { console.log('[DEBUG] addLlmUsageToAcc: null/0 usage, j.usage=' + (typeof j !== 'undefined' ? JSON.stringify(typeof j === 'object' ? j && j.usage : j) : 'j_not_defined')); return; }
   if (!Number.isFinite(usage.prompt) || !Number.isFinite(usage.completion) || !Number.isFinite(usage.total)) return;
   LLM_USAGE_ACC.prompt += usage.prompt;
   LLM_USAGE_ACC.completion += usage.completion;
@@ -725,7 +729,11 @@ async function getKimiSelectionByKimi() {
       body,
       timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
     });
-    addLlmUsageToAcc(parseLlmUsageFromResponse(j));
+    const u = parseLlmUsageFromResponse(j);
+    addLlmUsageToAcc(u);
+    if (u) {
+      console.log(`[DEBUG] LLM_USAGE ${JSON.stringify({ scope: 'runjs_select', model: LLM_MODEL, prompt_tokens: u.prompt, completion_tokens: u.completion, total_tokens: u.total, calls: 1 })}`);
+    }
     llmDebugLog('MAIL LLM select res: json=ok');
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const parsedJson = parseJsonFromLlm(content);
@@ -802,7 +810,11 @@ async function getAnnouncementDigestByKimi() {
       body,
       timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
     });
-    addLlmUsageToAcc(parseLlmUsageFromResponse(j));
+    const u = parseLlmUsageFromResponse(j);
+    addLlmUsageToAcc(u);
+    if (u) {
+      console.log(`[DEBUG] LLM_USAGE ${JSON.stringify({ scope: 'runjs_digest', model: LLM_MODEL, prompt_tokens: u.prompt, completion_tokens: u.completion, total_tokens: u.total, calls: 1 })}`);
+    }
     llmDebugLog(`MAIL LLM res: ms=${Date.now() - t0} json=ok`);
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const out = String(content || '');
