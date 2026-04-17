@@ -424,12 +424,12 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
   const items = parsed && Array.isArray(parsed.items) ? parsed.items : [];
   const out = { date: today, daily: [], perf_q1: [] };
   const seen = new Set();
-  const push = (k, v) => {
+  const cand = { daily: [], perf_q1: [] };
+  const addCand = (k, v, score) => {
     if (!v) return;
-    if (out[k].length >= 15) return;
     if (seen.has(v)) return;
     seen.add(v);
-    out[k].push(v);
+    cand[k].push({ v, score: Number.isFinite(score) ? score : 0 });
   };
   const parseLine = (t) => {
     const s = cleanOneLine(t);
@@ -440,6 +440,68 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
   const hasAny = (s, arr) => arr.some((k) => s.includes(k));
   const q1Marks = ['一季度', '第一季度', '1季度', 'Q1', '2026Q1', '2025Q1', '2024Q1', '季度报告'];
   const perfMarks = ['营收', '净利', '净利润', '同比', 'EPS', '每股收益', '业绩', '利润', '亏损', '预增', '预减', '快报'];
+  const dailyHigh = [
+    '中标',
+    '签订',
+    '合同',
+    '订单',
+    '长协',
+    '批量',
+    '投资',
+    '扩产',
+    '项目',
+    '算力',
+    '收购',
+    '并购',
+    '重组',
+    '重组委',
+    '通过',
+    '获批',
+    '控制权',
+    '变更',
+    '回购',
+    '注销',
+    '增持',
+    '恢复资格'
+  ];
+  const dailyRiskHigh = ['终止上市', '退市', '风险警示', '*ST', 'ST', '立案', '重大诉讼', '处罚', '冻结'];
+  const dailyNoise = [
+    '股东大会',
+    '会议资料',
+    '法律意见书',
+    '审计报告',
+    '内部控制',
+    '募集资金',
+    '担保',
+    '投资者关系',
+    '更正',
+    '补充',
+    '简式权益变动',
+    '质押',
+    '解除质押',
+    '减持',
+    '减持计划',
+    '解除限售'
+  ];
+  const hasNumber = (s) => /(\d+(?:\.\d+)?)(万亿元|亿元|万元|%|股)/.test(s);
+  const scoreDaily = (s) => {
+    let sc = 0;
+    if (hasAny(s, dailyHigh)) sc += 5;
+    if (hasAny(s, dailyRiskHigh)) sc += 6;
+    if (hasNumber(s)) sc += 2;
+    if (hasAny(s, dailyNoise)) sc -= 4;
+    return sc;
+  };
+  const scoreQ1 = (s) => {
+    let sc = 0;
+    if (hasAny(s, q1Marks)) sc += 5;
+    if (hasAny(s, perfMarks)) sc += 3;
+    if (hasNumber(s)) sc += 3;
+    if (s.includes('扭亏')) sc += 4;
+    if (s.includes('同比增')) sc += 2;
+    if (s.includes('同比降') || s.includes('下降') || s.includes('下滑')) sc -= 1;
+    return sc;
+  };
 
   for (const it of items) {
     const stockId = it && it.stockId ? String(it.stockId).trim() : '';
@@ -450,11 +512,30 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
     const p = cleanOneLine(point);
     const isQ1 = hasAny(p, q1Marks) || (hasAny(p, perfMarks) && /(?:^|\b)Q1(?:\b|$)/.test(p));
     if (isQ1) {
-      push('perf_q1', one);
+      addCand('perf_q1', one, scoreQ1(p));
       continue;
     }
-    push('daily', one);
+    addCand('daily', one, scoreDaily(p));
   }
+  cand.daily.sort((a, b) => (b.score || 0) - (a.score || 0));
+  cand.perf_q1.sort((a, b) => (b.score || 0) - (a.score || 0));
+  const fill = (k, minScore) => {
+    const picked = [];
+    for (const it of cand[k]) {
+      if (picked.length >= 15) break;
+      if ((it.score || 0) < minScore) continue;
+      picked.push(it.v);
+    }
+    if (picked.length === 0) {
+      for (const it of cand[k]) {
+        if (picked.length >= 15) break;
+        picked.push(it.v);
+      }
+    }
+    out[k] = picked;
+  };
+  fill('daily', 2);
+  fill('perf_q1', 4);
   return out;
 }
 
@@ -551,14 +632,34 @@ async function getKimiSelectionByKimi() {
     '请从下列公告摘要中进行“精选+分类”，输出严格 JSON（不要 markdown，不要解释，不要额外文本）。',
     '',
     '分类与字段：',
-    '- daily：日常公告（非业绩类，包含利好/利空/中性，如停牌、风险、终止上市等也归入此类）',
-    '- perf_q1：一季报业绩（只收录“第一季度/一季度/Q1/季度报告”等与一季报相关的业绩/财务信息，包含利好/利空/中性）',
+    '- daily：日常公告（非业绩类；以“重大利好/强催化”为主，必要时保留极重大风险项）',
+    '- perf_q1：一季报业绩（只收录“第一季度/一季度/Q1/季度报告”等一季报相关的业绩/财务信息；以超预期/高增/扭亏为主）',
     '',
     '输出要求：',
     '- JSON 顶层只允许包含 2 个字段：daily, perf_q1',
-    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序（宁缺毋滥）',
-    '- 每条字符串格式必须是“股票名：要点”',
+    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序（宁缺毋滥，可少于 15 条）',
+    '- 每条字符串格式必须是“股票名：要点”，不要带股票代码',
     '- 要点尽量 <= 60 个汉字，信息密度高，只写事实不推测/不编造，数字与单位尽量原样保留',
+    '',
+    '筛选与排序策略（非常重要）：',
+    '【日常公告 daily】优先级从高到低：',
+    '- 重大项目/投资/产能扩张/算力中心/海外基地等（含金额/规模/节点）',
+    '- 重大订单/中标/长协/供货进入批量（含金额/客户/期限）',
+    '- 并购重组/重大资产重组/发行股份+现金收购/重组委或交易所通过',
+    '- 控制权变更/大股东变更/无偿划转/股权变动（影响控制权）',
+    '- 回购注销/大额回购/大股东增持（金额/数量清晰）',
+    '- 监管重大进展：撤销风险、恢复资格、重大处罚/立案/诉讼等（只保留最重大）',
+    '',
+    '【一季报业绩 perf_q1】优先级从高到低：',
+    '- 明确“一季度/Q1/第一季度/季度报告”且给出核心数字（营收/净利/同比/EPS）',
+    '- 超高增速（如同比翻倍以上）、扭亏为盈、明显超预期',
+    '- 若仅是形式披露/提示性公告而无数字，尽量不选',
+    '',
+    '强制过滤/尽量不选（除非确有重大信息）：',
+    '- 股东大会通知/会议资料/法律意见书/审计报告/内部控制报告/募集资金存放与使用/担保进展/投资者关系活动记录表/更正公告/补充公告等日常文书',
+    '',
+    '风险项处理：',
+    '- “终止上市/退市/重大风险警示/重大处罚/重大诉讼/立案”等应归入 daily 且靠前（这是重大风险，不是利好）',
     '- 若没有可选条目，对应数组返回空数组 []',
     '',
     `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
@@ -572,7 +673,7 @@ async function getKimiSelectionByKimi() {
       { role: 'system', content: '你是严谨的中文财经快讯编辑。' },
       { role: 'user', content: prompt }
     ],
-    temperature: 0.2
+    temperature: 0.1
   });
   try {
     llmDebugLog(`MAIL LLM select req: model=${LLM_MODEL} host=${new URL(url).host} promptChars=${prompt.length} bodyBytes=${Buffer.byteLength(body)}`);
@@ -997,7 +1098,8 @@ module.exports = {
   injectStockNamesIntoKimiSection,
   buildServerChanRequest,
   formatKimiSelectionMessage,
-  normalizeKimiSelection
+  normalizeKimiSelection,
+  getKimiSelectionByKimi
 };
 
 if (require.main === module) {
