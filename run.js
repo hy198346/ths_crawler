@@ -399,12 +399,14 @@ function saveKimiSelectionCache(obj) {
 function normalizeKimiSelection(obj) {
   const safeArr = (v) => (Array.isArray(v) ? v.map((x) => cleanOneLine(x)).filter(Boolean) : []);
   const dateRaw = obj && typeof obj === 'object' && obj.date ? cleanOneLine(obj.date) : '';
+  const dailyRaw = safeArr(obj && obj.daily);
+  const perfQ1Raw = safeArr(obj && obj.perf_q1);
+  const legacyDaily = safeArr(obj && obj.ann_good).concat(safeArr(obj && obj.ann_bad));
+  const legacyPerf = safeArr(obj && obj.perf_good).concat(safeArr(obj && obj.perf_bad));
   const out = {
     date: /^\d{4}-\d{2}-\d{2}$/.test(dateRaw) ? dateRaw : '',
-    ann_good: safeArr(obj && obj.ann_good),
-    perf_good: safeArr(obj && obj.perf_good),
-    ann_bad: safeArr(obj && obj.ann_bad),
-    perf_bad: safeArr(obj && obj.perf_bad)
+    daily: dailyRaw.length ? dailyRaw : legacyDaily,
+    perf_q1: perfQ1Raw.length ? perfQ1Raw : legacyPerf
   };
   return out;
 }
@@ -412,17 +414,15 @@ function normalizeKimiSelection(obj) {
 function isKimiSelectionEmpty(sel) {
   const s = normalizeKimiSelection(sel);
   return (
-    (!s.ann_good || s.ann_good.length === 0) &&
-    (!s.perf_good || s.perf_good.length === 0) &&
-    (!s.ann_bad || s.ann_bad.length === 0) &&
-    (!s.perf_bad || s.perf_bad.length === 0)
+    (!s.daily || s.daily.length === 0) &&
+    (!s.perf_q1 || s.perf_q1.length === 0)
   );
 }
 
 function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
   const today = getShanghaiDayString();
   const items = parsed && Array.isArray(parsed.items) ? parsed.items : [];
-  const out = { date: today, ann_good: [], perf_good: [], ann_bad: [], perf_bad: [] };
+  const out = { date: today, daily: [], perf_q1: [] };
   const seen = new Set();
   const push = (k, v) => {
     if (!v) return;
@@ -438,11 +438,8 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
     return { name: cleanOneLine(m[2]), point: cleanOneLine(m[3]) };
   };
   const hasAny = (s, arr) => arr.some((k) => s.includes(k));
-  const perfMarks = ['营收', '净利', '净利润', '同比', 'EPS', '每股收益', '季度报告', '年报', '年度报告', '业绩', '利润', '亏损', '预增', '预减', '快报'];
-  const perfBadMarks = ['亏', '亏损', '下降', '下滑', '减少', '预减', '由盈转亏', '修正为亏', '同比降', '同比下降', '同比减少'];
-  const perfGoodMarks = ['增长', '同比增', '预增', '扭亏', '大增'];
-  const annGoodMarks = ['中标', '签订', '合同', '投资', '回购', '增持', '扩产', '项目', '获批', '通过', '合作', '并购', '收购', '订单'];
-  const annBadMarks = ['减持', '诉讼', '处罚', '立案', '终止', '风险', '冻结', '退市', '被动', '下调', '警示'];
+  const q1Marks = ['一季度', '第一季度', '1季度', 'Q1', '2026Q1', '2025Q1', '2024Q1', '季度报告'];
+  const perfMarks = ['营收', '净利', '净利润', '同比', 'EPS', '每股收益', '业绩', '利润', '亏损', '预增', '预减', '快报'];
 
   for (const it of items) {
     const stockId = it && it.stockId ? String(it.stockId).trim() : '';
@@ -451,18 +448,12 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
     const stockName = name || (nameMap && stockId && nameMap.get(stockId) ? String(nameMap.get(stockId)) : '');
     const one = `${cleanOneLine(stockName || stockId)}：${point}`;
     const p = cleanOneLine(point);
-    const isPerf = hasAny(p, perfMarks);
-    if (isPerf) {
-      const isBad = hasAny(p, perfBadMarks) && !hasAny(p, perfGoodMarks);
-      const isGood = hasAny(p, perfGoodMarks) && !hasAny(p, perfBadMarks);
-      if (isBad) push('perf_bad', one);
-      else push('perf_good', one);
+    const isQ1 = hasAny(p, q1Marks) || (hasAny(p, perfMarks) && /(?:^|\b)Q1(?:\b|$)/.test(p));
+    if (isQ1) {
+      push('perf_q1', one);
       continue;
     }
-    const isAnnBad = hasAny(p, annBadMarks);
-    const isAnnGood = hasAny(p, annGoodMarks);
-    if (isAnnBad && !isAnnGood) push('ann_bad', one);
-    else push('ann_good', one);
+    push('daily', one);
   }
   return out;
 }
@@ -492,10 +483,8 @@ function mergeKimiSelectionDaily(selection) {
   };
   const merged = {
     date: today,
-    ann_good: mergeArr(cur.ann_good, shouldMergePrev ? prev.ann_good : []),
-    perf_good: mergeArr(cur.perf_good, shouldMergePrev ? prev.perf_good : []),
-    ann_bad: mergeArr(cur.ann_bad, shouldMergePrev ? prev.ann_bad : []),
-    perf_bad: mergeArr(cur.perf_bad, shouldMergePrev ? prev.perf_bad : [])
+    daily: mergeArr(cur.daily, shouldMergePrev ? prev.daily : []),
+    perf_q1: mergeArr(cur.perf_q1, shouldMergePrev ? prev.perf_q1 : [])
   };
   if (isKimiSelectionEmpty(cur) && shouldMergePrev && !isKimiSelectionEmpty(prev)) {
     const keep = { ...prev, date: today };
@@ -518,17 +507,13 @@ function formatKimiSelectionMessage(obj) {
   };
   const dateLine = s.date ? `日期：${s.date}` : '';
   return [
-    '### 公告要闻（Kimi精选）',
+    '### 公告精选',
     '',
     dateLine,
     '',
-    section('一、公告利好', s.ann_good),
+    section('一、日常公告', s.daily),
     '',
-    section('二、业绩利好', s.perf_good),
-    '',
-    section('三、公告利空', s.ann_bad),
-    '',
-    section('四、业绩利空', s.perf_bad)
+    section('二、一季报业绩', s.perf_q1)
   ].join('\n');
 }
 
@@ -566,16 +551,14 @@ async function getKimiSelectionByKimi() {
     '请从下列公告摘要中进行“精选+分类”，输出严格 JSON（不要 markdown，不要解释，不要额外文本）。',
     '',
     '分类与字段：',
-    '- ann_good：公告利好（非业绩类）',
-    '- perf_good：业绩利好（财报/业绩快报/业绩预告/分红等偏利好）',
-    '- ann_bad：公告利空（非业绩类）',
-    '- perf_bad：业绩利空（财报/业绩快报/业绩预告等偏利空）',
+    '- daily：日常公告（非业绩类，包含利好/利空/中性，如停牌、风险、终止上市等也归入此类）',
+    '- perf_q1：一季报业绩（只收录“第一季度/一季度/Q1/季度报告”等与一季报相关的业绩/财务信息，包含利好/利空/中性）',
     '',
     '输出要求：',
-    '- JSON 顶层只允许包含 4 个字段：ann_good, perf_good, ann_bad, perf_bad',
-    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序',
+    '- JSON 顶层只允许包含 2 个字段：daily, perf_q1',
+    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序（宁缺毋滥）',
     '- 每条字符串格式必须是“股票名：要点”',
-    '- 要点尽量 <= 50 个汉字，信息密度高，只写事实不推测/不编造，数字与单位尽量原样保留',
+    '- 要点尽量 <= 60 个汉字，信息密度高，只写事实不推测/不编造，数字与单位尽量原样保留',
     '- 若没有可选条目，对应数组返回空数组 []',
     '',
     `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
