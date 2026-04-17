@@ -11,6 +11,9 @@ const RETRY_INTERVAL = Number(process.env.RETRY_INTERVAL_MS || (IS_GITHUB_ACTION
 const EXEC_TIMEOUT = Number(process.env.EXEC_TIMEOUT_MS || (IS_GITHUB_ACTIONS ? 15 * 60 * 1000 : 30 * 60 * 1000));
 const SUCCESS_FLAG = 'created'; // 成功标识
 const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
+const EMAIL_MONITOR_ADDR = process.env.EMAIL_MONITOR_ADDR;
+const EMAIL_MONITOR_AUTH = process.env.EMAIL_MONITOR_AUTH;
+const EMAIL_MONITOR_WEBHOOK_KEY = process.env.EMAIL_MONITOR_WEBHOOK_KEY;
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
@@ -111,6 +114,20 @@ function requestJson(targetUrl, { method = 'GET', headers = {}, body = null, tim
     if (body) req.write(body);
     req.end();
   });
+}
+
+function parseJsonFromLlm(text) {
+  const s = String(text || '').trim();
+  if (!s) return null;
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  const sub = s.slice(start, end + 1);
+  try {
+    return JSON.parse(sub);
+  } catch {
+    return null;
+  }
 }
 
 function formatBytes(bytes) {
@@ -286,6 +303,145 @@ function saveKimiDigestCache(markdown) {
   try {
     fs.writeFileSync(p, `${s}\n`, 'utf8');
   } catch {}
+}
+
+function getKimiSelectionCachePath() {
+  if (process.env.ANNOUNCE_KIMI_SELECT_CACHE_PATH) return path.resolve(process.env.ANNOUNCE_KIMI_SELECT_CACHE_PATH);
+  return path.resolve(__dirname, 'extern_user_kimi_select.json');
+}
+
+function loadKimiSelectionCache() {
+  const p = getKimiSelectionCachePath();
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    const j = JSON.parse(String(raw || ''));
+    if (!j || typeof j !== 'object') return null;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+function saveKimiSelectionCache(obj) {
+  const p = getKimiSelectionCachePath();
+  try {
+    fs.writeFileSync(p, `${JSON.stringify(obj || {}, null, 2)}\n`, 'utf8');
+  } catch {}
+}
+
+function normalizeKimiSelection(obj) {
+  const safeArr = (v) => (Array.isArray(v) ? v.map((x) => cleanOneLine(x)).filter(Boolean) : []);
+  const out = {
+    ann_good: safeArr(obj && obj.ann_good),
+    perf_good: safeArr(obj && obj.perf_good),
+    ann_bad: safeArr(obj && obj.ann_bad),
+    perf_bad: safeArr(obj && obj.perf_bad)
+  };
+  return out;
+}
+
+function formatKimiSelectionMessage(obj) {
+  const s = normalizeKimiSelection(obj);
+  const clip15 = (arr) => arr.slice(0, 15);
+  const section = (title, arr) => {
+    const items = clip15(arr);
+    if (!items.length) return `${title}\n\n无`;
+    return `${title}\n\n${items.join('\n')}`;
+  };
+  return [
+    'Kimi精选',
+    '',
+    section('一、公告利好', s.ann_good),
+    '',
+    section('二、业绩利好', s.perf_good),
+    '',
+    section('三、公告利空', s.ann_bad),
+    '',
+    section('四、业绩利空', s.perf_bad)
+  ].join('\n');
+}
+
+async function getKimiSelectionByKimi() {
+  if (!LLM_API_KEY) return null;
+  let parsed;
+  try {
+    parsed = parseAnnouncementFileForLlm();
+  } catch {
+    return null;
+  }
+  if (!parsed || !parsed.count) return null;
+
+  const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
+  const maxInChars = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_CHARS || 120000);
+  const safeMaxLines = Number.isFinite(maxInLines) && maxInLines > 0 ? Math.floor(maxInLines) : 800;
+  const safeMaxChars = Number.isFinite(maxInChars) && maxInChars > 2000 ? Math.floor(maxInChars) : 120000;
+
+  const picked = [];
+  let used = 0;
+  for (const it of parsed.items) {
+    if (picked.length >= safeMaxLines) break;
+    const one = `${it.stockId} ${it.text}`;
+    used += one.length + 1;
+    if (used > safeMaxChars) break;
+    picked.push(one);
+  }
+
+  const prompt = [
+    '你是严谨的中文财经快讯编辑。',
+    '请从下列公告摘要中进行“精选+分类”，输出严格 JSON（不要 markdown，不要解释，不要额外文本）。',
+    '',
+    '分类与字段：',
+    '- ann_good：公告利好（非业绩类）',
+    '- perf_good：业绩利好（财报/业绩快报/业绩预告/分红等偏利好）',
+    '- ann_bad：公告利空（非业绩类）',
+    '- perf_bad：业绩利空（财报/业绩快报/业绩预告等偏利空）',
+    '',
+    '输出要求：',
+    '- JSON 顶层只允许包含 4 个字段：ann_good, perf_good, ann_bad, perf_bad',
+    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序',
+    '- 每条字符串格式必须是“股票名：要点”',
+    '- 要点尽量 <= 50 个汉字，信息密度高，只写事实不推测/不编造，数字与单位尽量原样保留',
+    '- 若没有可选条目，对应数组返回空数组 []',
+    '',
+    `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
+    ...picked
+  ].join('\n');
+
+  const url = `${LLM_BASE_URL}/chat/completions`;
+  const body = JSON.stringify({
+    model: LLM_MODEL,
+    messages: [
+      { role: 'system', content: '你是严谨的中文财经快讯编辑。' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.2
+  });
+  try {
+    llmDebugLog(`MAIL LLM select req: model=${LLM_MODEL} host=${new URL(url).host} promptChars=${prompt.length} bodyBytes=${Buffer.byteLength(body)}`);
+    const j = await requestJson(new URL(url), {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LLM_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Accept-Encoding': 'identity'
+      },
+      body,
+      timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
+    });
+    llmDebugLog('MAIL LLM select res: json=ok');
+    const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
+    const parsedJson = parseJsonFromLlm(content);
+    if (!parsedJson) return null;
+    const normalized = normalizeKimiSelection(parsedJson);
+    saveKimiSelectionCache(normalized);
+    return normalized;
+  } catch (e) {
+    const sc = e && e.statusCode ? String(e.statusCode) : '';
+    console.warn(`MAIL LLM select failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+    if (e && e.body) console.warn(`MAIL LLM select body: ${cutByChars(e.body, 300)}`);
+    return null;
+  }
 }
 
 async function getAnnouncementDigestByKimi() {
@@ -465,6 +621,38 @@ function sendServerChan(message) {
   });
 }
 
+async function sendWeComMarkdown(content) {
+  const key = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
+  if (!key) return false;
+  const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${encodeURIComponent(key)}`;
+  const body = JSON.stringify({
+    msgtype: 'markdown',
+    markdown: { content: String(content || '') }
+  });
+  try {
+    const j = await requestJson(new URL(url), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Accept-Encoding': 'identity'
+      },
+      body,
+      timeoutMs: Number(process.env.WECOM_TIMEOUT_MS || 15000)
+    });
+    const errcode = Number(j && j.errcode != null ? j.errcode : NaN);
+    if (errcode === 0) {
+      console.log('✅ 企业微信通知发送成功');
+      return true;
+    }
+    console.error(`❌ 企业微信发送失败: errcode=${String(j && j.errcode)} errmsg=${String(j && j.errmsg)}`);
+    return false;
+  } catch (e) {
+    console.error(`企业微信请求失败: ${e && e.message ? e.message : e}`);
+    return false;
+  }
+}
+
 function runCrawler() {
   const startTime = new Date();
   const attempt = retryCount + 1;
@@ -544,6 +732,7 @@ function runCrawler() {
             console.log(`Kimi精选跳过：公告无新增/更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
           }
           const cachedKimi = loadKimiDigestCache();
+          const cachedSel = loadKimiSelectionCache();
           let kimiDigest = '';
           if (shouldSkipKimi) {
             kimiDigest = cachedKimi;
@@ -553,8 +742,16 @@ function runCrawler() {
           } else {
             kimiDigest = (await getAnnouncementDigestByKimi()) || cachedKimi;
           }
+          let kimiSel = null;
+          if (shouldSkipKimi) {
+            kimiSel = cachedSel;
+            if (!kimiSel) kimiSel = await getKimiSelectionByKimi();
+          } else {
+            kimiSel = (await getKimiSelectionByKimi()) || cachedSel;
+          }
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
+          const wecomKimi = formatKimiSelectionMessage(kimiSel);
           const successMessage = [
             `### ✅ 爬虫任务成功执行`,
             `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -569,6 +766,10 @@ function runCrawler() {
             annSummary
           ].filter(Boolean).join('\n\n');
           console.log(`\n===== Server酱通知内容（预览）=====\n${successMessage}\n===== 结束 =====\n`);
+          if (EMAIL_MONITOR_ADDR && EMAIL_MONITOR_AUTH) {
+            console.log('EmailMonitor 配置已检测到（当前仅使用企业微信 Webhook 推送）');
+          }
+          await sendWeComMarkdown(wecomKimi);
           sendServerChan(successMessage).finally(() => process.exit(0));
         })().catch((e) => {
           console.error('Build notice failed:', e && e.message ? e.message : e);
@@ -617,7 +818,9 @@ function runCrawler() {
 module.exports = {
   loadStockNameMap,
   injectStockNamesIntoKimiSection,
-  buildServerChanRequest
+  buildServerChanRequest,
+  formatKimiSelectionMessage,
+  normalizeKimiSelection
 };
 
 if (require.main === module) {
