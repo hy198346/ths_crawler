@@ -56,7 +56,7 @@ jobs:
           ANN_LOOKBACK_DAYS: '1'
           ANN_RUN_TIMES: '3'
           CNINFO_PLATES: 'all'
-          CNINFO_MAX_PAGES: '300'va
+          CNINFO_MAX_PAGES: '300'
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           ANNOUNCEMENT_SUMMARY_CHARS: ${{ vars.ANNOUNCEMENT_SUMMARY_CHARS }}
           KIMI_DEBUG: ${{ vars.KIMI_DEBUG }}
