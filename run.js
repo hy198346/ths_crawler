@@ -514,11 +514,12 @@ function formatKimiSelectionMessage(obj) {
   const section = (title, arr) => {
     const items = clip15(arr);
     if (!items.length) return `${title}\n\n无`;
-    return `${title}\n\n${items.join('\n')}`;
+    return `${title}\n\n${items.join('\n\n')}`;
   };
   const dateLine = s.date ? `日期：${s.date}` : '';
   return [
-    '公告要闻（Kimi精选）',
+    '### 公告要闻（Kimi精选）',
+    '',
     dateLine,
     '',
     section('一、公告利好', s.ann_good),
