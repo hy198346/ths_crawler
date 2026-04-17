@@ -139,7 +139,9 @@ function cninfoIsTradingDay(dateStr, tradingDays) {
         const wd = new Intl.DateTimeFormat('en', { timeZone: CNINFO_TZ, weekday: 'short' }).format(new Date(dateStr + 'T00:00:00+08:00'));
         return wd !== 'Sat' && wd !== 'Sun';
     }
-    return tradingDays.has(dateStr);
+    if (tradingDays.has(dateStr)) return true;
+    const wd = new Intl.DateTimeFormat('en', { timeZone: CNINFO_TZ, weekday: 'short' }).format(new Date(dateStr + 'T00:00:00+08:00'));
+    return wd !== 'Sat' && wd !== 'Sun';
 }
 
 function cninfoPrevTradingDay(dateStr, tradingDays) {
@@ -562,7 +564,7 @@ async function cninfoQuery({ seDate, pageNum, pageSize, column, plate, category 
     return j;
 }
 
-async function cninfoDailyByStock(dateStr, endHourMinute) {
+async function cninfoDailyByStock(dateStr, endHourMinute, startHourMinute) {
     const out = new Map();
     const seenAnn = new Set();
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
@@ -572,7 +574,11 @@ async function cninfoDailyByStock(dateStr, endHourMinute) {
     const targetDayStart = dateStr ? new Date(dateStr + 'T00:00:00+08:00').getTime() : 0;
     const targetDayEnd = targetDayStart > 0 ? targetDayStart + 86400000 - 1 : 0;
     const ehm = endHourMinute;
-    const endCutoffMs = ehm ? new Date(dateStr + `T${String(ehm).slice(0, 2)}:${String(ehm).slice(2, 4)}:00+08:00`).getTime() : 0;
+    const ehmStr = ehm ? String(ehm).padStart(4, '0') : '';
+    const endCutoffMs = ehmStr ? new Date(dateStr + `T${ehmStr.slice(0, 2)}:${ehmStr.slice(2, 4)}:00+08:00`).getTime() : targetDayEnd;
+    const shm = startHourMinute;
+    const shmStr = shm ? String(shm).padStart(4, '0') : '';
+    const startCutoffMs = shmStr ? new Date(dateStr + `T${shmStr.slice(0, 2)}:${shmStr.slice(2, 4)}:00+08:00`).getTime() : 0;
 
     for (const q of queries) {
         const plate = q && q.plate !== undefined ? String(q.plate) : '';
@@ -615,8 +621,7 @@ async function cninfoDailyByStock(dateStr, endHourMinute) {
                 if (!secCode) continue;
                 const announcementId = String(item.announcementId || item.announcement_id || '').trim();
                 const epochMs = cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0;
-                const effectiveEnd = endCutoffMs || targetDayEnd;
-                if (targetDayStart > 0 && (epochMs < targetDayStart || epochMs > effectiveEnd)) continue;
+                if (epochMs < startCutoffMs || epochMs > endCutoffMs) continue;
                 const title = String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
                 const adjunctUrl = String(item.adjunctUrl || item.adjunct_url || '').trim();
                 const timeStr = formatCninfoTime(item.announcementTime || item.announcement_time || '');
@@ -727,42 +732,41 @@ async function cninfoPickDays(lookbackDays) {
     const d = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
     const merged = new Map();
     const tradingDays = await cninfoFetchTradingDays();
-    const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
-    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(nowBJ);
+    const now = new Date();
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
     const prevStr = cninfoPrevTradingDay(todayStr, tradingDays);
-    const prevPrevStr = cninfoPrevTradingDay(prevStr, tradingDays);
     const nextStr = cninfoNextTradingDay(todayStr, tradingDays);
-    const hhmm = Number(nowBJ.toISOString().slice(11, 16).replace(':', ''));
+    const hhmmParts = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, hour: '2-digit', minute: '2-digit', hour12: false })
+        .formatToParts(now);
+    const hhmmObj = Object.create(null);
+    for (const p of hhmmParts) {
+        if (p.type !== 'literal') hhmmObj[p.type] = p.value;
+    }
+    const hhmm = Number(`${hhmmObj.hour || '00'}${hhmmObj.minute || '00'}`);
     const isTodayTradingDay = cninfoIsTradingDay(todayStr, tradingDays);
+
+    const fetchRange = async (startDate, endDate) => {
+        const sMap = await cninfoDailyByStock(startDate, null, 930);
+        const eMap = endDate ? await cninfoDailyByStock(endDate, 930) : new Map();
+        for (const [k, v] of sMap.entries()) {
+            const cur = merged.get(k);
+            merged.set(k, cur ? cninfoMergeStockEntry(cur, v) : v);
+        }
+        for (const [k, v] of eMap.entries()) {
+            const cur = merged.get(k);
+            merged.set(k, cur ? cninfoMergeStockEntry(cur, v) : v);
+        }
+    };
 
     if (d === 1) {
         if (!isTodayTradingDay) {
-            const prevDayMap = await cninfoDailyByStock(prevStr);
-            for (const [k, v] of prevDayMap.entries()) {
-                const cur = merged.get(k);
-                if (!cur) merged.set(k, v);
-                else merged.set(k, cninfoMergeStockEntry(cur, v));
-            }
-        } else if (hhmm < 930) {
-            const prevPrevDayMap = await cninfoDailyByStock(prevPrevStr);
-            const todayDayMap = await cninfoDailyByStock(todayStr, 930);
-            for (const [k, v] of prevPrevDayMap.entries()) {
-                const cur = merged.get(k);
-                if (!cur) merged.set(k, v);
-                else merged.set(k, cninfoMergeStockEntry(cur, v));
-            }
-            for (const [k, v] of todayDayMap.entries()) {
-                const cur = merged.get(k);
-                if (!cur) merged.set(k, v);
-                else merged.set(k, cninfoMergeStockEntry(cur, v));
-            }
+            await fetchRange(prevStr, nextStr);
+            return merged;
+        }
+        if (hhmm >= 930) {
+            await fetchRange(todayStr, nextStr);
         } else {
-            const dayMap = await cninfoDailyByStock(todayStr);
-            for (const [k, v] of dayMap.entries()) {
-                const cur = merged.get(k);
-                if (!cur) merged.set(k, v);
-                else merged.set(k, cninfoMergeStockEntry(cur, v));
-            }
+            await fetchRange(prevStr, todayStr);
         }
         return merged;
     }
@@ -772,11 +776,10 @@ async function cninfoPickDays(lookbackDays) {
     while (fetched < days) {
         const day = cninfoDateString(off);
         if (cninfoIsTradingDay(day, tradingDays)) {
-            const dayMap = await cninfoDailyByStock(day);
+            const dayMap = await cninfoDailyByStock(day, null, 930);
             for (const [k, v] of dayMap.entries()) {
                 const cur = merged.get(k);
-                if (!cur) merged.set(k, v);
-                else merged.set(k, cninfoMergeStockEntry(cur, v));
+                merged.set(k, cur ? cninfoMergeStockEntry(cur, v) : v);
             }
             fetched++;
         }
@@ -1094,7 +1097,7 @@ async function main() {
             async (entry) => {
                 const secCode = entry && entry.secCode ? String(entry.secCode) : '';
                 const secName = entry && entry.secName ? String(entry.secName) : '';
-                const announcementTime = entry && entry.latestTime ? String(entry.latestTime) : '';
+                const announcementTime = cleanOneLine(entry && entry.latestTime ? entry.latestTime : '');
                 const annsAllRaw = entry && Array.isArray(entry.announcements) ? entry.announcements : [];
                 const annsAll = pickLatestDayAnns(annsAllRaw);
                 const cap = Number.isFinite(ANNOUNCEMENT_MAX_PER_STOCK_RANGE) && ANNOUNCEMENT_MAX_PER_STOCK_RANGE > 0

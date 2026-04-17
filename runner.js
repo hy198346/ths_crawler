@@ -75,10 +75,13 @@ function stripCreatedLines(text) {
 
 async function main() {
     console.log(`Runner start: thsTmp=${THS_TMP_PATH} annTmp=${ANN_TMP_PATH} out=${OUT_PATH}`);
-    const thsPromise = runNode('crawler.js', {
-        STOCK_INFO_FILE_PATH: THS_TMP_PATH,
-        ENABLE_ANNOUNCEMENTS: 'false'
-    });
+    const onlyAnn = ['1', 'true', 'yes', 'on'].includes(String(process.env.RUNNER_ONLY_ANN || '').trim().toLowerCase());
+    const thsPromise = onlyAnn
+        ? Promise.resolve({ ok: true, code: 0, stdout: '', stderr: '' })
+        : runNode('crawler.js', {
+            STOCK_INFO_FILE_PATH: THS_TMP_PATH,
+            ENABLE_ANNOUNCEMENTS: 'false'
+        });
 
     const annPromise = runNode('announcement_fetcher.js', {
         ANN_OUTPUT_PATH: ANN_TMP_PATH
@@ -93,6 +96,10 @@ async function main() {
     if (!ann.ok) {
         if (ann.stdout) process.stdout.write(ann.stdout);
         if (ann.stderr) process.stderr.write(ann.stderr);
+        if (onlyAnn) {
+            process.exit(1);
+            return;
+        }
         console.warn('公告抓取失败，继续生成同花顺结果');
     } else {
         if (ann.stdout) process.stdout.write(ann.stdout);
@@ -104,15 +111,18 @@ async function main() {
         return;
     }
 
-    if (!fs.existsSync(THS_TMP_PATH)) {
+    if (!onlyAnn && !fs.existsSync(THS_TMP_PATH)) {
         console.error('同花顺临时文件不存在');
         process.exit(1);
         return;
     }
 
-    const thsBuf = fs.readFileSync(THS_TMP_PATH);
-    const thsText = iconv.decode(thsBuf, 'GBK');
-    console.log(`Runner thsTmpBytes: ${thsBuf.length}`);
+    let thsText = '';
+    if (!onlyAnn) {
+        const thsBuf = fs.readFileSync(THS_TMP_PATH);
+        thsText = iconv.decode(thsBuf, 'GBK');
+        console.log(`Runner thsTmpBytes: ${thsBuf.length}`);
+    }
 
     let annText = '';
     if (fs.existsSync(ANN_TMP_PATH)) {

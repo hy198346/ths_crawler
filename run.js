@@ -299,6 +299,65 @@ function parseAnnouncementFileForLlm() {
   const today = excludeMidnightToday
     ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
     : '';
+  const dateRuleOn = !['0', 'false', 'no', 'off'].includes(String(process.env.ANNOUNCE_KIMI_DATE_RULE || '1').trim().toLowerCase());
+  const nowParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).formatToParts(new Date());
+  const nowObj = Object.create(null);
+  for (const p of nowParts) {
+    if (p.type !== 'literal') nowObj[p.type] = p.value;
+  }
+  const nowDayStr = `${nowObj.year}-${nowObj.month}-${nowObj.day}`;
+  const nowHHMM = Number(`${nowObj.hour || '00'}${nowObj.minute || '00'}`);
+  const isTradingDayByWeekend = (dayStr) => {
+    const wd = new Intl.DateTimeFormat('en', { timeZone: 'Asia/Shanghai', weekday: 'short' }).format(new Date(dayStr + 'T00:00:00+08:00'));
+    return wd !== 'Sat' && wd !== 'Sun';
+  };
+  const shiftDay = (dayStr, offDays) => {
+    const base = new Date(dayStr + 'T00:00:00+08:00');
+    const d = new Date(base.getTime() + Math.floor(offDays) * 86400000);
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  };
+  const prevTradingDay = (dayStr) => {
+    for (let off = -1; off >= -20; off--) {
+      const s = shiftDay(dayStr, off);
+      if (isTradingDayByWeekend(s)) return s;
+    }
+    return dayStr;
+  };
+  const nextTradingDay = (dayStr) => {
+    for (let off = 1; off <= 20; off++) {
+      const s = shiftDay(dayStr, off);
+      if (isTradingDayByWeekend(s)) return s;
+    }
+    return dayStr;
+  };
+  const isNowTradingDay = isTradingDayByWeekend(nowDayStr);
+  const prevDayStr = prevTradingDay(nowDayStr);
+  const nextDayStr = nextTradingDay(nowDayStr);
+  const startDayStr = isNowTradingDay
+    ? (nowHHMM >= 930 ? nowDayStr : prevDayStr)
+    : prevDayStr;
+  const endDayStr = isNowTradingDay
+    ? (nowHHMM >= 930 ? nextDayStr : nowDayStr)
+    : nextDayStr;
+  const includeByDateRule = (timeStr) => {
+    if (!dateRuleOn) return true;
+    const m = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2}):(\d{2})\b/.exec(String(timeStr || '').trim());
+    if (!m) return false;
+    const dayStr = m[1];
+    const hhmm = Number(`${m[2]}${m[3]}`);
+    if (!Number.isFinite(hhmm)) return false;
+    if (dayStr === startDayStr && hhmm >= 930) return true;
+    if (dayStr === endDayStr && hhmm < 930) return true;
+    return false;
+  };
   const windowHours = Number(process.env.ANNOUNCE_KIMI_WINDOW_HOURS || 24);
   const nowMs = Date.now();
   const windowStartMs = Number.isFinite(windowHours) && windowHours > 0 ? nowMs - Math.floor(windowHours * 3600 * 1000) : 0;
@@ -309,21 +368,33 @@ function parseAnnouncementFileForLlm() {
     const t = Date.parse(iso);
     return Number.isFinite(t) ? t : 0;
   };
+  const parseAnnLocalFields = (text) => {
+    const s = cleanOneLine(text || '');
+    const m = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(.*)$/.exec(s);
+    if (!m) return { time: '', name: '', point: s };
+    const time = String(m[1] || '').trim();
+    const rest = cleanOneLine(m[2] || '');
+    const m2 = /^(.+?)\s+(.*)$/.exec(rest);
+    if (!m2) return { time, name: '', point: rest };
+    return { time, name: cleanOneLine(m2[1] || ''), point: cleanOneLine(m2[2] || '') };
+  };
   for (const line of lines) {
     const parts = line.split('|');
     if (parts.length < 5) continue;
     const stockId = String(parts[1] || '').trim();
     const text = cleanOneLine(parts[3] || '');
     if (!stockId || !text) continue;
+    const fields = parseAnnLocalFields(text);
     if (excludeMidnightToday) {
       const m = text.match(/^(\d{4}-\d{2}-\d{2})\s+00:00:00\b/);
       if (m && m[1] === today) continue;
     }
+    if (!includeByDateRule(fields.time || '')) continue;
     if (windowStartMs) {
       const ts = parseShanghaiEpoch(text);
       if (!ts || ts < windowStartMs || ts > nowMs + 60000) continue;
     }
-    items.push({ stockId, text });
+    items.push({ stockId, text, time: fields.time, name: fields.name, point: fields.point });
   }
   return { count: items.length, items };
 }
@@ -607,7 +678,7 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
   return out;
 }
 
-function mergeKimiSelectionDaily(selection) {
+function mergeKimiSelectionDaily(selection, timeByStockName) {
   const today = getShanghaiDayString();
   const cur = normalizeKimiSelection(selection);
   const prevRaw = loadKimiSelectionCache();
@@ -638,16 +709,17 @@ function mergeKimiSelectionDaily(selection) {
   if (isKimiSelectionEmpty(cur) && shouldMergePrev && !isKimiSelectionEmpty(prev)) {
     const keep = { ...prev, date: today };
     saveKimiSelectionCache(keep);
-    saveKimiDigestCache(formatKimiSelectionMessage(keep));
+    saveKimiDigestCache(formatKimiSelectionMessage(keep, timeByStockName));
     return keep;
   }
   saveKimiSelectionCache(merged);
-  saveKimiDigestCache(formatKimiSelectionMessage(merged));
+  saveKimiDigestCache(formatKimiSelectionMessage(merged, timeByStockName));
   return merged;
 }
 
-function formatKimiSelectionMessage(obj) {
+function formatKimiSelectionMessage(obj, timeByStockName) {
   const s = normalizeKimiSelection(obj);
+  const dateRuleOn = !['0', 'false', 'no', 'off'].includes(String(process.env.ANNOUNCE_KIMI_DATE_RULE || '1').trim().toLowerCase());
   const clip15 = (arr) => arr.slice(0, 15);
   const section = (title, arr) => {
     const items = clip15(arr);
@@ -655,14 +727,41 @@ function formatKimiSelectionMessage(obj) {
     return `${title}\n\n${items.join('\n\n')}`;
   };
   const dateLine = s.date ? `日期：${s.date}` : '';
+  const timeFmt = (name) => {
+    if (timeByStockName instanceof Map && name) {
+      const t = timeByStockName.get(name);
+      if (t) return ` [${t}]`;
+    }
+    return '';
+  };
+  const sectionT = (title, arr) => {
+    const items = clip15(arr);
+    if (!items.length) return `${title}\n\n无`;
+    const lines = [];
+    for (const item of items) {
+      const colonIdx = item.indexOf('：');
+      if (colonIdx > 0) {
+        const name = item.slice(0, colonIdx);
+        const rest = item.slice(colonIdx);
+        const tf = timeFmt(name);
+        if (dateRuleOn && !tf) continue;
+        lines.push(`${name}${tf}${rest}`);
+        continue;
+      }
+      if (dateRuleOn) continue;
+      lines.push(item);
+    }
+    if (!lines.length) return `${title}\n\n无`;
+    return `${title}\n\n${lines.join('\n\n')}`;
+  };
   return [
     '### 公告精选',
     '',
     dateLine,
     '',
-    section('一、日常公告', s.daily),
+    sectionT('一、日常公告', s.daily),
     '',
-    section('二、业绩', s.perf_q1)
+    sectionT('二、业绩', s.perf_q1)
   ].join('\n');
 }
 
@@ -676,8 +775,36 @@ async function getKimiSelectionByKimi() {
   if (!parsed || !parsed.count) return null;
 
   const nameMap = loadStockNameMap();
+  const parseShanghaiEpoch = (s) => {
+    const m = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2}):(\d{2})\b/.exec(String(s || '').trim());
+    if (!m) return 0;
+    const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}+08:00`;
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? t : 0;
+  };
+  const latestTimeByStockId = new Map();
+  const nameByStockId = new Map();
+  for (const it of (parsed.items || [])) {
+    const code = it && it.stockId ? String(it.stockId).trim() : '';
+    if (!code) continue;
+    const time = it && it.time ? String(it.time).trim() : '';
+    const ts = parseShanghaiEpoch(time || (it && it.text ? String(it.text) : ''));
+    if (!ts || !time) continue;
+    const prev = latestTimeByStockId.get(code);
+    if (!prev || (prev.ts || 0) < ts) latestTimeByStockId.set(code, { ts, time });
+    if (it && it.name) {
+      const n = cleanOneLine(String(it.name || ''));
+      if (n && !nameByStockId.has(code)) nameByStockId.set(code, n);
+    }
+  }
+  const timeByStockName = new Map();
+  for (const [code, v] of latestTimeByStockId.entries()) {
+    const n = cleanOneLine((nameMap && nameMap.get(code)) || nameByStockId.get(code) || '');
+    if (n && v && v.time) timeByStockName.set(n, String(v.time));
+  }
   if (!LLM_API_KEY) {
-    return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
+    const sel = mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap), timeByStockName);
+    return { sel, timeByStockName };
   }
 
   const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
@@ -685,15 +812,25 @@ async function getKimiSelectionByKimi() {
   const safeMaxLines = Number.isFinite(maxInLines) && maxInLines > 0 ? Math.floor(maxInLines) : 800;
   const safeMaxChars = Number.isFinite(maxInChars) && maxInChars > 2000 ? Math.floor(maxInChars) : 120000;
 
-  const picked = [];
+  const pickedWithId = [];
   let used = 0;
   for (const it of parsed.items) {
-    if (picked.length >= safeMaxLines) break;
-    const one = `${it.stockId} ${it.text}`;
+    if (pickedWithId.length >= safeMaxLines) break;
+    const stockId = String(it.stockId || '').trim();
+    const stockName = cleanOneLine((it && it.name) || (nameMap && nameMap.get(stockId)) || stockId);
+    let point = cleanOneLine((it && it.point) || '');
+    if (!point) {
+      const text0 = cleanOneLine((it && it.text) || '');
+      let rest = text0.replace(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+/, '');
+      if (stockName && rest.startsWith(stockName)) rest = cleanOneLine(rest.slice(stockName.length));
+      point = rest;
+    }
+    const one = `${stockName}：${point}`;
     used += one.length + 1;
     if (used > safeMaxChars) break;
-    picked.push(one);
+    pickedWithId.push({ stockId: it.stockId, text: one });
   }
+  const picked = pickedWithId.map((it) => it.text);
 
   const prompt = [
     '你是严谨的中文财经快讯编辑。',
@@ -739,14 +876,17 @@ async function getKimiSelectionByKimi() {
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const parsedJson = parseJsonFromLlm(content);
     if (!parsedJson) {
-      return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
+      const sel = mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap), timeByStockName);
+      return { sel, timeByStockName };
     }
-    return mergeKimiSelectionDaily(parsedJson);
+    const sel = mergeKimiSelectionDaily(parsedJson, timeByStockName);
+    return { sel, timeByStockName };
   } catch (e) {
     const sc = e && e.statusCode ? String(e.statusCode) : '';
     console.warn(`MAIL LLM select failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
     if (e && e.body) console.warn(`MAIL LLM select body: ${cutByChars(e.body, 300)}`);
-    return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
+    const sel = mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap), timeByStockName);
+    return { sel, timeByStockName };
   }
 }
 
@@ -759,6 +899,7 @@ async function getAnnouncementDigestByKimi() {
     return '';
   }
   if (!parsed || !parsed.count) return '';
+  const nameMap = loadStockNameMap();
 
   const topN = Number(process.env.ANNOUNCE_KIMI_TOP_N || 30);
   const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
@@ -771,7 +912,10 @@ async function getAnnouncementDigestByKimi() {
   let used = 0;
   for (const it of parsed.items) {
     if (picked.length >= safeMaxLines) break;
-    const one = `${it.stockId} ${it.text}`;
+    const stockId = String(it.stockId || '').trim();
+    const stockName = cleanOneLine((it && it.name) || (nameMap && nameMap.get(stockId)) || '');
+    const point = cleanOneLine((it && it.point) || '');
+    const one = `${stockId} ${stockName ? `${stockName} ` : ''}${point}`.trim();
     used += one.length + 1;
     if (used > safeMaxChars) break;
     picked.push(one);
@@ -1107,16 +1251,23 @@ function runCrawler() {
             kimiDigest = (await getAnnouncementDigestByKimi()) || cachedKimi;
           }
           let kimiSel = null;
+          let kimiTimeByName = null;
           if (shouldSkipKimi) {
-            kimiSel = cachedSel;
-            if (!kimiSel) kimiSel = await getKimiSelectionByKimi();
+            const cached = cachedSel;
+            if (cached) { kimiSel = cached; }
+            else {
+              const r = await getKimiSelectionByKimi();
+              if (r) { kimiSel = r.sel; kimiTimeByName = r.timeByStockName; }
+            }
           } else {
-            kimiSel = (await getKimiSelectionByKimi()) || cachedSel;
+            const r = await getKimiSelectionByKimi();
+            if (r) { kimiSel = r.sel; kimiTimeByName = r.timeByStockName; }
+            else if (cachedSel) { kimiSel = cachedSel; }
           }
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
-          const mergedSel = mergeKimiSelectionDaily(kimiSel || {});
-          const wecomKimi = formatKimiSelectionMessage(mergedSel);
+          const mergedSel = mergeKimiSelectionDaily(kimiSel || {}, kimiTimeByName);
+          const wecomKimi = formatKimiSelectionMessage(mergedSel, kimiTimeByName);
           const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: usageLine });
           const successMessage = [
               `### ✅ 爬虫任务成功执行`,
