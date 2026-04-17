@@ -1,6 +1,7 @@
 node_modules/
 extern_user*.txt
 !extern_user_ann.txt
+extern_user_kimi_select.json
 stock_list_cache.json
 crawler-secret.json
 .env

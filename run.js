@@ -187,11 +187,11 @@ function parseAnnouncementFileForLlm() {
   const raw = fs.readFileSync(annPath, 'utf8');
   const lines = raw.split(/\r?\n/).filter(Boolean);
   const items = [];
-  const excludeMidnightToday = !['0', 'false', 'no', 'off'].includes(String(process.env.ANNOUNCE_KIMI_EXCLUDE_MIDNIGHT || '1').trim().toLowerCase());
+  const excludeMidnightToday = !['0', 'false', 'no', 'off'].includes(String(process.env.ANNOUNCE_KIMI_EXCLUDE_MIDNIGHT || '0').trim().toLowerCase());
   const today = excludeMidnightToday
     ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
     : '';
-  const windowHours = Number(process.env.ANNOUNCE_KIMI_WINDOW_HOURS || 12);
+  const windowHours = Number(process.env.ANNOUNCE_KIMI_WINDOW_HOURS || 24);
   const nowMs = Date.now();
   const windowStartMs = Number.isFinite(windowHours) && windowHours > 0 ? nowMs - Math.floor(windowHours * 3600 * 1000) : 0;
   const parseShanghaiEpoch = (s) => {
@@ -303,6 +303,73 @@ function saveKimiDigestCache(markdown) {
   try {
     fs.writeFileSync(p, `${s}\n`, 'utf8');
   } catch {}
+}
+
+function getShanghaiDayString() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+function extractKimiDigestItems(markdown) {
+  const text = String(markdown || '');
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for (const line of lines) {
+    const t = String(line || '').trim();
+    if (!t.startsWith('- ')) continue;
+    out.push(t);
+  }
+  return out;
+}
+
+function parseKimiDigestMeta(markdown) {
+  const text = String(markdown || '');
+  const mDate = /日期[:：]\s*(\d{4}-\d{2}-\d{2})/.exec(text);
+  const mCnt = /共\s*(\d+)\s*条公告/.exec(text);
+  return {
+    date: mDate ? String(mDate[1] || '').trim() : '',
+    totalCount: mCnt ? Number(mCnt[1]) : 0,
+    items: extractKimiDigestItems(text)
+  };
+}
+
+function renderKimiDigestMarkdown(items, totalCount, dayStr) {
+  const arr = Array.isArray(items) ? items.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  if (!arr.length) return '';
+  const cnt = Number.isFinite(Number(totalCount)) && Number(totalCount) > 0 ? Math.floor(Number(totalCount)) : 0;
+  const day = String(dayStr || '').trim();
+  const tailParts = [];
+  if (day) tailParts.push(`日期：${day}`);
+  if (cnt) tailParts.push(`共${cnt}条公告`);
+  const tail = tailParts.length ? `\n\n（${tailParts.join('，')}）` : '';
+  return `### 📌 公告要闻（Kimi精选）\n\n${arr.join('\n')}${tail}`;
+}
+
+function mergeKimiDigestDaily(newMd, parsedCount, maxItems) {
+  const today = getShanghaiDayString();
+  const newItems = extractKimiDigestItems(newMd);
+  if (!newItems.length) return String(newMd || '');
+  const cap = Number.isFinite(maxItems) && maxItems > 0 ? Math.floor(maxItems) : 30;
+  const oldMd = loadKimiDigestCache();
+  const oldMeta = parseKimiDigestMeta(oldMd);
+  const shouldMergeOld = oldMeta.items.length > 0 && (!oldMeta.date || oldMeta.date === today);
+  const oldItems = shouldMergeOld ? oldMeta.items : [];
+  const maxCountPrev = shouldMergeOld && Number.isFinite(Number(oldMeta.totalCount)) ? Number(oldMeta.totalCount) : 0;
+  const uniq = [];
+  const seen = new Set();
+  const pushOne = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return;
+    if (seen.has(t)) return;
+    seen.add(t);
+    uniq.push(t);
+  };
+  for (const it of newItems) pushOne(it);
+  for (const it of oldItems) pushOne(it);
+  const merged = uniq.slice(0, cap);
+  const maxCount = Math.max(Number.isFinite(Number(parsedCount)) ? Number(parsedCount) : 0, maxCountPrev);
+  const outMd = renderKimiDigestMarkdown(merged, maxCount, today) || String(newMd || '');
+  saveKimiDigestCache(outMd);
+  return outMd;
 }
 
 function getKimiSelectionCachePath() {
@@ -513,8 +580,7 @@ async function getAnnouncementDigestByKimi() {
     const normalized = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).join('\n\n');
     if (!normalized) return '';
     const md = `### 📌 公告要闻（Kimi精选）\n\n${normalized}\n\n（共${parsed.count}条公告）`;
-    saveKimiDigestCache(md);
-    return md;
+    return mergeKimiDigestDaily(md, parsed.count, safeTopN);
   } catch (e) {
     const sc = e && e.statusCode ? String(e.statusCode) : '';
     console.warn(`MAIL LLM digest failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
@@ -623,7 +689,10 @@ function sendServerChan(message) {
 
 async function sendWeComMarkdown(content) {
   const key = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
-  if (!key) return false;
+  if (!key) {
+    console.warn('未设置 EMAIL_MONITOR_WEBHOOK_KEY，跳过企业微信通知');
+    return false;
+  }
   const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${encodeURIComponent(key)}`;
   const body = JSON.stringify({
     msgtype: 'markdown',
@@ -651,6 +720,26 @@ async function sendWeComMarkdown(content) {
     console.error(`企业微信请求失败: ${e && e.message ? e.message : e}`);
     return false;
   }
+}
+
+function trimWeComMarkdown(content) {
+  const maxChars = Number(process.env.WECOM_MAX_CHARS || 3800);
+  const s = String(content || '');
+  const cap = Number.isFinite(maxChars) && maxChars > 200 ? Math.floor(maxChars) : 3800;
+  if (s.length <= cap) return s;
+  return `${s.slice(0, cap)}\n\n...(内容过长已截断)`;
+}
+
+function buildWeComNotice({ kimiSelectionText, kimiDigestMarkdown }) {
+  const parts = [];
+  const sel = String(kimiSelectionText || '').trim();
+  const dig = String(kimiDigestMarkdown || '').trim();
+  if (sel) {
+    parts.push('### Kimi精选（分类）');
+    parts.push(sel);
+  }
+  if (dig) parts.push(dig);
+  return trimWeComMarkdown(parts.filter(Boolean).join('\n\n---\n\n'));
 }
 
 function runCrawler() {
@@ -752,6 +841,7 @@ function runCrawler() {
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const wecomKimi = formatKimiSelectionMessage(kimiSel);
+          const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: annSummary });
           const successMessage = [
             `### ✅ 爬虫任务成功执行`,
             `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -769,7 +859,7 @@ function runCrawler() {
           if (EMAIL_MONITOR_ADDR && EMAIL_MONITOR_AUTH) {
             console.log('EmailMonitor 配置已检测到（当前仅使用企业微信 Webhook 推送）');
           }
-          await sendWeComMarkdown(wecomKimi);
+          await sendWeComMarkdown(wecomContent);
           sendServerChan(successMessage).finally(() => process.exit(0));
         })().catch((e) => {
           console.error('Build notice failed:', e && e.message ? e.message : e);
