@@ -62,6 +62,7 @@ jobs:
           KIMI_DEBUG: ${{ vars.KIMI_DEBUG }}
           ANNOUNCE_KIMI_TOP_N: ${{ vars.ANNOUNCE_KIMI_TOP_N }}
           EMAIL_MONITOR_WEBHOOK_KEY: ${{ secrets.EMAIL_MONITOR_WEBHOOK_KEY }}
+          ANN_LOOKBACK_DAYS: ${{ vars.ANN_LOOKBACK_DAYS }}          
           
         run: |
           echo "当前工作目录: $(pwd)"
