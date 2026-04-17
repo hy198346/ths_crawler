@@ -301,9 +301,9 @@ const ADAPTIVE_SEVERE_NETERR = 0.6;
 const ADAPTIVE_PAUSE_MS = 5000;
 const ENABLE_ANNOUNCEMENTS = process.env.ENABLE_ANNOUNCEMENTS === 'true';
 
-// 正则表达式常量
+// 正则表达式常�?
 const STOCK_SALE_LIMIT_REGEX = /预计解除限售|限售解禁/;
-const STOCK_REDUCE_REGEX = /增减持计划/;
+const STOCK_REDUCE_REGEX = /增减持计划|增持|减持/;
 const STOCK_INVESTIGATE_REGEX = /立案调查/;
 
 const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
@@ -322,7 +322,7 @@ const ANNOUNCEMENT_SUMMARY_CHARS = Number(process.env.ANNOUNCEMENT_SUMMARY_CHARS
 const ANNOUNCEMENT_SUMMARY_CONCURRENCY = Number(process.env.ANNOUNCEMENT_SUMMARY_CONCURRENCY || 3);
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
-const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
+const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.MOONSHOT_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
 const CNINFO_TZ = process.env.CNINFO_TZ || 'Asia/Shanghai';
 const ANN_TIME_FORMAT = String(process.env.ANN_TIME_FORMAT || '').trim().toLowerCase();
@@ -667,7 +667,7 @@ function resolveStockList({ fetchedStocks, savedStocks, cachedStocks }) {
     return { stocks: fetched, source: 'fetched', updateSaved, updateCache };
 }
 
-// 全局状态
+// 全局状�?
 let stockData = {
     coreView: "",
     mainBusiness: "",
@@ -682,7 +682,7 @@ let stockData = {
     announcementCnt: 0
 };
 
-// 初始化日志
+// 初始化日�?
 if (crawler_config.config.logsFile) {
     crawler_tools.logFileInit();
 }
@@ -948,13 +948,42 @@ function llmDebugLog(msg) {
     console.log(String(msg || ''));
 }
 
+const LLM_USAGE_ACC = { prompt: 0, completion: 0, total: 0, calls: 0 };
+
+function addLlmUsage(usage) {
+    if (!usage) return;
+    const pt = usage.prompt_tokens != null ? Number(usage.prompt_tokens) : NaN;
+    const ct = usage.completion_tokens != null ? Number(usage.completion_tokens) : NaN;
+    const tt = usage.total_tokens != null ? Number(usage.total_tokens) : NaN;
+    if (![pt, ct].every((n) => Number.isFinite(n) && n >= 0)) return;
+    const total = Number.isFinite(tt) && tt >= 0 ? tt : pt + ct;
+    LLM_USAGE_ACC.prompt += pt;
+    LLM_USAGE_ACC.completion += ct;
+    LLM_USAGE_ACC.total += total;
+    LLM_USAGE_ACC.calls += 1;
+}
+
+function emitLlmUsageSummary() {
+    if (!LLM_USAGE_ACC.calls) return;
+    process.stdout.write(
+        `LLM_USAGE ${JSON.stringify({
+            scope: 'crawler',
+            model: LLM_MODEL,
+            prompt_tokens: LLM_USAGE_ACC.prompt,
+            completion_tokens: LLM_USAGE_ACC.completion,
+            total_tokens: LLM_USAGE_ACC.total,
+            calls: LLM_USAGE_ACC.calls
+        })}\n`
+    );
+}
+
 async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, announcementTitle }, maxChars) {
     const fallback = cutByChars(announcementTitle || '', maxChars);
     if (!LLM_API_KEY) {
         llmDebugLog(`CRAWLER LLM off: missing apiKey sec=${secCode || ''}`);
         return fallback;
     }
-    const prompt = `请将以下公告信息改写成一句“财经网站标题风格”的内容要点，不超过${maxChars}个汉字：要求精炼、信息密度高、只写事实不推测/不编造，数字与单位尽量原样保留；不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）；不要输出标题字样/不要换行。输入：股票:${secCode} 时间:${announcementTime} 标题:${announcementTitle}`;
+    const prompt = `请将以下公告信息改写成一句“财经网站标题风格”的内容要点，不超过${maxChars}个汉字：要求精炼、信息密度高、只写事实不推测/不编造，数字与单位尽量原样保留；不要出现公司名称/简�?股票名称（可用“公司”代替或省略主语）；不要输出标题字样/不要换行。输入：股票:${secCode} 时间:${announcementTime} 标题:${announcementTitle}`;
     const url = `${LLM_BASE_URL}/chat/completions`;
     try {
         const t0 = Date.now();
@@ -986,6 +1015,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
         } catch {
             j = null;
         }
+        if (j && typeof j === 'object' && j.usage) addLlmUsage(j.usage);
         const tookMs = Date.now() - t0;
         llmDebugLog(`CRAWLER LLM res: sec=${secCode || ''} ms=${tookMs} bytes=${buf.length} json=${j ? 'ok' : 'fail'}`);
         if (!j) {
@@ -1455,7 +1485,8 @@ async function processStocks(stockList, opts = {}) {
                 }
 
                 finishedCount += 1;
-                if (finishedCount % 100 === 0 || finishedCount === totalStocks) {
+                const step = totalStocks > 0 ? Math.ceil(totalStocks * 0.10) : 100;
+                if (finishedCount % step === 0 || finishedCount === totalStocks) {
                     const percent = Math.min(100, (finishedCount / totalStocks) * 100);
                     const prefix = label ? `${label} ` : '';
                     console.log(`${prefix}Progress: ${percent.toFixed(2)}% completed`);
@@ -1549,7 +1580,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
                 $('span.main-bussiness-text').find('a.newtaid').text()
             );
             if (!coreViewText && !mainBusinessText) {
-                const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检查/i.test(html);
+                const blocked = /验证码|captcha|安全验证|访问过于频繁|安全检测/i.test(html);
                 if (blocked) {
                     const err = new Error('Blocked HTML response');
                     err.isTunnelProxyError = shouldPreferTunnelProxy() && isTunnelProxyEnabled();
@@ -1646,7 +1677,7 @@ async function getStockInfo(stockId, exchangeId, session, overrides = null) {
 
 function extractSpecialEvents($, stockPrefix) {
     $('div.new_msg div.overview table tr').each((index, element) => {
-        if (index >= 20) return false; // 最多读取20行
+        if (index >= 20) return false; // 最多读�?0�?
         
         const title = crawler_tools.str_trim($(element).find('td strong.hltip').text());
         if (!title) return;
@@ -1685,7 +1716,7 @@ function processInvestigate(element, $, stockPrefix) {
     let text = crawler_tools.str_trim(element.find('td span').text());
     text = text.replace(/[\r\n]+/g, "").replace(/\s+/g, "");
     
-    const index = text.indexOf('▼');
+    const index = text.indexOf('...');
     if (index !== -1) text = text.substring(0, index);
     
     const detailIndex = text.indexOf('详细内容');
@@ -1793,7 +1824,14 @@ async function fetchHtml(url, timeoutMs = 15000, session) {
 }
 
 if (require.main === module) {
-    main().catch(console.error);
+    main()
+        .catch((e) => {
+            console.error(e);
+            process.exitCode = 1;
+        })
+        .finally(() => {
+            emitLlmUsageSummary();
+        });
 }
 
 module.exports = {

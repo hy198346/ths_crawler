@@ -11,7 +11,7 @@ const CNINFO_PAGE_SIZE = Number(process.env.CNINFO_PAGE_SIZE || 50);
 const CNINFO_MAX_PAGES = Number(process.env.CNINFO_MAX_PAGES || 300);
 const CNINFO_TIMEOUT_MS = Number(process.env.CNINFO_TIMEOUT_MS || 20000);
 const CNINFO_STALL_PAGES = Number(process.env.CNINFO_STALL_PAGES || 2);
-const CNINFO_LOG_EVERY_PAGES = Number(process.env.CNINFO_LOG_EVERY_PAGES || 10);
+const CNINFO_LOG_EVERY_PAGES = Number(process.env.CNINFO_LOG_EVERY_PAGES || 30);
 const CNINFO_PLATES = String(process.env.CNINFO_PLATES || 'all')
     .split(',')
     .map((s) => s.trim())
@@ -253,6 +253,26 @@ function cutByChars(s, maxChars) {
 function llmDebugLog(msg) {
     if (!LLM_DEBUG) return;
     console.log(String(msg || ''));
+}
+
+const LLM_USAGE_ACC = { prompt: 0, completion: 0, total: 0, calls: 0 };
+
+function addLlmUsage(u) {
+    if (!u || typeof u !== 'object') return;
+    const pt = Number(u.prompt_tokens) || 0;
+    const ct = Number(u.completion_tokens) || 0;
+    const total = Number(u.total_tokens) || (pt + ct);
+    if (!pt && !ct) return;
+    LLM_USAGE_ACC.prompt += pt;
+    LLM_USAGE_ACC.completion += ct;
+    LLM_USAGE_ACC.total += total;
+    LLM_USAGE_ACC.calls += 1;
+}
+
+function flushLlmUsage() {
+    if (!LLM_USAGE_ACC.calls) return;
+    const model = LLM_MODEL || 'unknown';
+    console.log(`LLM_USAGE ${JSON.stringify({ scope: 'announcement_fetcher', model, prompt_tokens: LLM_USAGE_ACC.prompt, completion_tokens: LLM_USAGE_ACC.completion, total_tokens: LLM_USAGE_ACC.total, calls: LLM_USAGE_ACC.calls })}`);
 }
 
 function formatAnnTime(timeStr) {
@@ -509,20 +529,14 @@ async function cninfoDailyByStock(dateStr) {
         for (let page = 1; page <= maxPages; page += 1) {
             let j;
             try {
-                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
-                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
-                if (shouldLog) {
-                    console.log(`ANN CNINFO query: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page}/${maxPages} pageSize=${pageSize}`);
-                }
                 j = await cninfoQuery({ seDate, pageNum: page, pageSize, column, plate, category });
             } catch (e) {
                 cninfoFailCnt++;
-                console.warn(`CNINFO daily query failed: plate=${plate || 'na'} col=${column} cat=${category || 'na'} date=${dateStr} page=${page} err=${e && e.message ? e.message : e}`);
+                console.warn(`ANN query failed: plate=${plate || 'na'} page=${page} err=${e && e.message ? e.message : String(e)}`);
                 break;
             }
             const items = j && Array.isArray(j.announcements) ? j.announcements : null;
             if (!items || items.length === 0) {
-                console.log(`ANN CNINFO empty: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page}`);
                 break;
             }
             const totalPages = j && Number.isFinite(Number(j.totalpages)) ? Number(j.totalpages) : 0;
@@ -531,21 +545,14 @@ async function cninfoDailyByStock(dateStr) {
                     const secCode = String((it && (it.secCode || it.sec_code)) || '').trim();
                     const announcementId = String((it && (it.announcementId || it.announcement_id)) || '').trim();
                     const epochMs = cninfoEpochMs((it && (it.announcementTime || it.announcement_time)) || '') || 0;
-                    const title = String((it && (it.announcementTitle || it.announcement_title)) || '')
-                        .replace(/[\r\n]+/g, ' ')
-                        .replace(/\s+/g, ' ')
-                        .trim();
                     const adjunctUrl = String((it && (it.adjunctUrl || it.adjunct_url)) || '').trim();
                     if (announcementId) return `id:${announcementId}`;
-                    return `k:${secCode}|${epochMs}|${adjunctUrl}|${title}`;
+                    return `k:${secCode}|${epochMs}|${adjunctUrl}`;
                 })
                 .join(',');
-            {
-                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
-                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
-                if (shouldLog) {
-                    console.log(`ANN CNINFO items: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length}`);
-                }
+            const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
+            if (logEvery && (page === 1 || page % logEvery === 0 || page === maxPages)) {
+                console.log(`ANN page=${page}/${maxPages} items=${items.length} stocks=${out.size}`);
             }
             let addedNewStock = 0;
             let addedNewAnn = 0;
@@ -562,34 +569,15 @@ async function cninfoDailyByStock(dateStr) {
                 seenAnn.add(seenKey);
                 let entry = out.get(secCode);
                 if (!entry) {
-                    entry = {
-                        secCode,
-                        secName: String(item.secName || item.sec_name || '').trim(),
-                        latestEpochMs: epochMs,
-                        latestTime: timeStr,
-                        announcements: []
-                    };
+                    entry = { secCode, secName: String(item.secName || item.sec_name || '').trim(), latestEpochMs: epochMs, latestTime: timeStr, announcements: [] };
                     out.set(secCode, entry);
                     addedNewStock++;
                 }
-                entry.announcements.push({
-                    announcementId,
-                    title,
-                    time: timeStr,
-                    epochMs,
-                    adjunctUrl
-                });
+                entry.announcements.push({ announcementId, title, time: timeStr, epochMs, adjunctUrl });
                 addedNewAnn++;
                 if (epochMs > (entry.latestEpochMs || 0)) {
                     entry.latestEpochMs = epochMs;
                     entry.latestTime = timeStr;
-                }
-            }
-            {
-                const logEvery = Number.isFinite(CNINFO_LOG_EVERY_PAGES) && CNINFO_LOG_EVERY_PAGES > 0 ? Math.floor(CNINFO_LOG_EVERY_PAGES) : 0;
-                const shouldLog = page === 1 || (logEvery && page % logEvery === 0) || page === maxPages;
-                if (shouldLog) {
-                    console.log(`ANN CNINFO unique: plate=${plate || 'na'} col=${column} date=${dateStr} uniqueStocks=${out.size}`);
                 }
             }
             if (totalPages <= 0) {
@@ -602,13 +590,9 @@ async function cninfoDailyByStock(dateStr) {
             }
             lastPageSig = pageSig;
             if (totalPages <= 0 && stallLimit && stallCount >= stallLimit) {
-                console.log(`ANN CNINFO stop on stall: plate=${plate || 'na'} col=${column} date=${dateStr} stallPages=${stallCount}`);
                 break;
             }
             if (totalPages > 0 && page >= totalPages) {
-                console.log(
-                    `ANN CNINFO stop on tail: plate=${plate || 'na'} col=${column} date=${dateStr} page=${page} items=${items.length} pageSize=${pageSize} totalPages=${totalPages || 'na'}`
-                );
                 break;
             }
         }
@@ -763,6 +747,7 @@ async function llmSummarizeAnnouncement({ secCode, secName, announcementTime, an
             if (!j) {
                 llmDebugLog(`ANN LLM resHead: ${cutByChars(text, 220)}`);
             }
+            if (j && typeof j === 'object' && j.usage) addLlmUsage(j.usage);
             const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
             const out = cutByChars(content || '', maxChars);
             llmDebugLog(`ANN LLM out: sec=${secCode || ''} outChars=${out.length} fallback=${out ? 'no' : 'yes'}`);
@@ -926,12 +911,7 @@ function saveSummaryCache(filePath, cacheObj) {
 }
 
 async function main() {
-    console.log(`ANN Start: out=${ANN_OUTPUT_PATH}`);
-    console.log(`ANN Config: tz=${CNINFO_TZ} pageSize=${CNINFO_PAGE_SIZE} maxPages=${CNINFO_MAX_PAGES} stallPages=${CNINFO_STALL_PAGES} timeoutMs=${CNINFO_TIMEOUT_MS}`);
-    console.log(`ANN CNINFO plates: ${CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES.join(',') : 'sz'}`);
-    console.log(`ANN Output: timeFormat=${ANN_TIME_FORMAT || 'full'} decimals=${Number.isFinite(ANN_DECIMAL_DIGITS) ? Math.floor(ANN_DECIMAL_DIGITS) : 2}`);
-    console.log(`ANN Summary: chars=${ANNOUNCEMENT_SUMMARY_CHARS} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} llm=${LLM_API_KEY ? 'on' : 'off'} model=${LLM_MODEL} base=${LLM_BASE_URL}`);
-    console.log(`ANN PDF: parser=${pdfParse ? 'on' : 'off'} maxPerStockDay=${ANNOUNCEMENT_MAX_PER_STOCK_DAY} maxPerStockRange=${ANNOUNCEMENT_MAX_PER_STOCK_RANGE} pdfConc=${ANNOUNCEMENT_PDF_CONCURRENCY} pdfMaxChars=${ANNOUNCEMENT_PDF_MAX_CHARS}`);
+    console.log(`ANN Start: plates=${(CNINFO_PLATES && CNINFO_PLATES.length ? CNINFO_PLATES.join(',') : 'sz')} maxPages=${CNINFO_MAX_PAGES} conc=${ANNOUNCEMENT_SUMMARY_CONCURRENCY} model=${LLM_MODEL}`);
     const proxy = getTunnelProxyConfig();
     console.log(`ANN Proxy: ${proxy ? `${proxy.host}:${proxy.port}` : 'off'}`);
     const { exchangeMap, nameMap } = loadStockMetaMaps();
@@ -1184,6 +1164,7 @@ async function main() {
     console.log(
         `ANN Done: written=${mergedMap.size} lastRunWritten=${lastFetchedCnt} runs=${runs} cninfoFail=${cninfoFailCnt} llmUsed=${llmUsedCnt} llmSameAsTitle=${llmSameAsTitleCnt} llmFallback=${llmFallbackCnt} llmFail=${llmFailCnt}`
     );
+    flushLlmUsage();
 }
 
 main().catch((e) => {

@@ -10,14 +10,17 @@ const MAX_RETRIES = Number(process.env.MAX_RETRIES || (IS_GITHUB_ACTIONS ? 2 : 5
 const RETRY_INTERVAL = Number(process.env.RETRY_INTERVAL_MS || (IS_GITHUB_ACTIONS ? 60000 : 120000));
 const EXEC_TIMEOUT = Number(process.env.EXEC_TIMEOUT_MS || (IS_GITHUB_ACTIONS ? 15 * 60 * 1000 : 30 * 60 * 1000));
 const SUCCESS_FLAG = 'created'; // 成功标识
-const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密钥
+const SERVERCHAN_KEY = process.env.SERVERCHAN_KEY; // 从环境变量获取Server酱密�?
 const EMAIL_MONITOR_ADDR = process.env.EMAIL_MONITOR_ADDR;
 const EMAIL_MONITOR_AUTH = process.env.EMAIL_MONITOR_AUTH;
 const EMAIL_MONITOR_WEBHOOK_KEY = process.env.EMAIL_MONITOR_WEBHOOK_KEY;
 const LLM_MODEL = process.env.KIMI_MODEL || process.env.LLM_MODEL || 'kimi-k2-turbo-preview';
 const LLM_BASE_URL = (process.env.KIMI_BASE_URL || process.env.LLM_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
-const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.LLM_API_KEY || '';
+const LLM_API_KEY = process.env.KIMI_API_KEY || process.env.MOONSHOT_API_KEY || process.env.LLM_API_KEY || '';
 const LLM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.KIMI_DEBUG || process.env.LLM_DEBUG || '').trim().toLowerCase());
+const WECOM_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.WECOM_DEBUG || '').trim().toLowerCase());
+
+const LLM_USAGE_ACC = { prompt: 0, completion: 0, total: 0, calls: 0 };
 
 let retryCount = 0;
 
@@ -44,6 +47,106 @@ function cutByChars(s, maxChars) {
 function llmDebugLog(msg) {
   if (!LLM_DEBUG) return;
   console.log(String(msg || ''));
+}
+
+function maskSecret(s, { keepStart = 0, keepEnd = 4 } = {}) {
+  const t = String(s || '');
+  const a = Math.max(0, Math.floor(keepStart));
+  const b = Math.max(0, Math.floor(keepEnd));
+  if (!t) return '';
+  if (t.length <= a + b + 4) {
+    const mid = Math.max(0, t.length - a - b);
+    return `${t.slice(0, a)}${'*'.repeat(mid)}${t.slice(t.length - b)}`;
+  }
+  return `${t.slice(0, a)}****${t.slice(t.length - b)}`;
+}
+
+function parseLlmUsageFromResponse(j) {
+  const u = j && typeof j === 'object' ? j.usage : null;
+  const pt = u && u.prompt_tokens != null ? Number(u.prompt_tokens) : NaN;
+  const ct = u && u.completion_tokens != null ? Number(u.completion_tokens) : NaN;
+  const tt = u && u.total_tokens != null ? Number(u.total_tokens) : NaN;
+  if (![pt, ct].every((n) => Number.isFinite(n) && n >= 0)) return null;
+  const total = Number.isFinite(tt) && tt >= 0 ? tt : pt + ct;
+  return { prompt: pt, completion: ct, total };
+}
+
+function addLlmUsageToAcc(usage) {
+  if (!usage) return;
+  if (!Number.isFinite(usage.prompt) || !Number.isFinite(usage.completion) || !Number.isFinite(usage.total)) return;
+  LLM_USAGE_ACC.prompt += usage.prompt;
+  LLM_USAGE_ACC.completion += usage.completion;
+  LLM_USAGE_ACC.total += usage.total;
+  LLM_USAGE_ACC.calls += 1;
+}
+
+function parseLlmUsageFromLogs(text) {
+  const out = { prompt: 0, completion: 0, total: 0, calls: 0 };
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const m = /^\s*LLM_USAGE\s+(.+)\s*$/.exec(line);
+    if (!m) continue;
+    let j;
+    try {
+      j = JSON.parse(m[1]);
+    } catch {
+      j = null;
+    }
+    if (!j) continue;
+    const pt = j.prompt_tokens != null ? Number(j.prompt_tokens) : NaN;
+    const ct = j.completion_tokens != null ? Number(j.completion_tokens) : NaN;
+    const tt = j.total_tokens != null ? Number(j.total_tokens) : NaN;
+    if (![pt, ct].every((n) => Number.isFinite(n) && n >= 0)) continue;
+    const total = Number.isFinite(tt) && tt >= 0 ? tt : pt + ct;
+    out.prompt += pt;
+    out.completion += ct;
+    out.total += total;
+    out.calls += 1;
+  }
+  return out;
+}
+
+function formatMoney(n, currency) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '未知';
+  return `${currency}${v.toFixed(4)}`;
+}
+
+function computeLlmCostByEnv(usage) {
+  const inPrice = Number(process.env.KIMI_PRICE_IN_PER_1M || process.env.LLM_PRICE_IN_PER_1M || '');
+  const outPrice = Number(process.env.KIMI_PRICE_OUT_PER_1M || process.env.LLM_PRICE_OUT_PER_1M || '');
+  if (!Number.isFinite(inPrice) || !Number.isFinite(outPrice) || inPrice < 0 || outPrice < 0) return null;
+  const inCost = (usage.prompt / 1_000_000) * inPrice;
+  const outCost = (usage.completion / 1_000_000) * outPrice;
+  const total = inCost + outCost;
+  return { inCost, outCost, total };
+}
+
+async function fetchKimiBalance() {
+  if (!LLM_API_KEY) return null;
+  const url = `${LLM_BASE_URL}/users/me/balance`;
+  try {
+    const j = await requestJson(new URL(url), {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${LLM_API_KEY}`,
+        'Accept-Encoding': 'identity'
+      },
+      timeoutMs: Number(process.env.KIMI_BALANCE_TIMEOUT_MS || 15000)
+    });
+    const data = j && typeof j === 'object' ? j.data : null;
+    const available = data && data.available_balance != null ? Number(data.available_balance) : NaN;
+    const voucher = data && data.voucher_balance != null ? Number(data.voucher_balance) : NaN;
+    if (!Number.isFinite(available) && !Number.isFinite(voucher)) return null;
+    return { available: Number.isFinite(available) ? available : null, voucher: Number.isFinite(voucher) ? voucher : null };
+  } catch (e) {
+    if (WECOM_DEBUG) {
+      const sc = e && e.statusCode ? String(e.statusCode) : '';
+      console.warn(`Kimi balance failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
+      if (e && e.body) console.warn(`Kimi balance body: ${cutByChars(e.body, 260)}`);
+    }
+    return null;
+  }
 }
 
 function getTunnelProxyConfig() {
@@ -275,7 +378,7 @@ function injectStockNamesIntoKimiSection(markdown, nameMap) {
       out.push(line);
       continue;
     }
-    const joiner = restTrim && /^[：:，,。．、;；!?！？]/.test(restTrim) ? '' : (restTrim ? ' ' : '');
+    const joiner = restTrim && /^[,，.。!！?？]/.test(restTrim) ? '' : (restTrim ? ' ' : '');
     out.push(`- ${code} ${name}${joiner}${restTrim}`);
   }
   return out.join('\n');
@@ -440,50 +543,10 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
   const hasAny = (s, arr) => arr.some((k) => s.includes(k));
   const q1Marks = ['一季度', '第一季度', '1季度', 'Q1', '2026Q1', '2025Q1', '2024Q1', '季度报告'];
   const perfMarks = ['营收', '净利', '净利润', '同比', 'EPS', '每股收益', '业绩', '利润', '亏损', '预增', '预减', '快报'];
-  const dailyHigh = [
-    '中标',
-    '签订',
-    '合同',
-    '订单',
-    '长协',
-    '批量',
-    '投资',
-    '扩产',
-    '项目',
-    '算力',
-    '收购',
-    '并购',
-    '重组',
-    '重组委',
-    '通过',
-    '获批',
-    '控制权',
-    '变更',
-    '回购',
-    '注销',
-    '增持',
-    '恢复资格'
-  ];
+  const dailyHigh = ['中标', '签订', '合同', '订单', '长协', '批量', '投资', '扩产', '项目', '算力', '收购', '并购', '重组', '通过', '获批', '控制权', '变更', '回购', '注销', '增持', '恢复资格'];
   const dailyRiskHigh = ['终止上市', '退市', '风险警示', '*ST', 'ST', '立案', '重大诉讼', '处罚', '冻结'];
-  const dailyNoise = [
-    '股东大会',
-    '会议资料',
-    '法律意见书',
-    '审计报告',
-    '内部控制',
-    '募集资金',
-    '担保',
-    '投资者关系',
-    '更正',
-    '补充',
-    '简式权益变动',
-    '质押',
-    '解除质押',
-    '减持',
-    '减持计划',
-    '解除限售'
-  ];
-  const hasNumber = (s) => /(\d+(?:\.\d+)?)(万亿元|亿元|万元|%|股)/.test(s);
+  const dailyNoise = ['股东大会', '会议资料', '法律意见书', '审计报告', '内部控制', '募集资金', '担保', '投资者关系', '更正', '补充', '简式权益变动', '质押', '解除质押', '减持', '减持计划', '解除限售'];
+  const hasNumber = (s) => /(\d+(?:\.\d+)?)(万亿元|亿元|万元|%|倍|元)/.test(s);
   const scoreDaily = (s) => {
     let sc = 0;
     if (hasAny(s, dailyHigh)) sc += 5;
@@ -498,8 +561,8 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
     if (hasAny(s, perfMarks)) sc += 3;
     if (hasNumber(s)) sc += 3;
     if (s.includes('扭亏')) sc += 4;
-    if (s.includes('同比增')) sc += 2;
-    if (s.includes('同比降') || s.includes('下降') || s.includes('下滑')) sc -= 1;
+    if (s.includes('同比增长') || s.includes('同比增加')) sc += 2;
+    if (s.includes('同比下降') || s.includes('同比减少') || s.includes('下降') || s.includes('下滑')) sc -= 1;
     return sc;
   };
 
@@ -508,7 +571,7 @@ function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
     const rawText = it && it.text ? String(it.text) : '';
     const { name, point } = parseLine(rawText);
     const stockName = name || (nameMap && stockId && nameMap.get(stockId) ? String(nameMap.get(stockId)) : '');
-    const one = `${cleanOneLine(stockName || stockId)}：${point}`;
+    const one = `${cleanOneLine(stockName || stockId)}：${cleanOneLine(point)}`;
     const p = cleanOneLine(point);
     const isQ1 = hasAny(p, q1Marks) || (hasAny(p, perfMarks) && /(?:^|\b)Q1(?:\b|$)/.test(p));
     if (isQ1) {
@@ -594,7 +657,7 @@ function formatKimiSelectionMessage(obj) {
     '',
     section('一、日常公告', s.daily),
     '',
-    section('二、一季报业绩', s.perf_q1)
+    section('二、业绩', s.perf_q1)
   ].join('\n');
 }
 
@@ -631,36 +694,10 @@ async function getKimiSelectionByKimi() {
     '你是严谨的中文财经快讯编辑。',
     '请从下列公告摘要中进行“精选+分类”，输出严格 JSON（不要 markdown，不要解释，不要额外文本）。',
     '',
-    '分类与字段：',
-    '- daily：日常公告（非业绩类；以“重大利好/强催化”为主，必要时保留极重大风险项）',
-    '- perf_q1：一季报业绩（只收录“第一季度/一季度/Q1/季度报告”等一季报相关的业绩/财务信息；以超预期/高增/扭亏为主）',
-    '',
-    '输出要求：',
-    '- JSON 顶层只允许包含 2 个字段：daily, perf_q1',
-    '- 每个字段的值是字符串数组，每类最多 15 条，按重要性降序（宁缺毋滥，可少于 15 条）',
-    '- 每条字符串格式必须是“股票名：要点”，不要带股票代码',
-    '- 要点尽量 <= 60 个汉字，信息密度高，只写事实不推测/不编造，数字与单位尽量原样保留',
-    '',
-    '筛选与排序策略（非常重要）：',
-    '【日常公告 daily】优先级从高到低：',
-    '- 重大项目/投资/产能扩张/算力中心/海外基地等（含金额/规模/节点）',
-    '- 重大订单/中标/长协/供货进入批量（含金额/客户/期限）',
-    '- 并购重组/重大资产重组/发行股份+现金收购/重组委或交易所通过',
-    '- 控制权变更/大股东变更/无偿划转/股权变动（影响控制权）',
-    '- 回购注销/大额回购/大股东增持（金额/数量清晰）',
-    '- 监管重大进展：撤销风险、恢复资格、重大处罚/立案/诉讼等（只保留最重大）',
-    '',
-    '【一季报业绩 perf_q1】优先级从高到低：',
-    '- 明确“一季度/Q1/第一季度/季度报告”且给出核心数字（营收/净利/同比/EPS）',
-    '- 超高增速（如同比翻倍以上）、扭亏为盈、明显超预期',
-    '- 若仅是形式披露/提示性公告而无数字，尽量不选',
-    '',
-    '强制过滤/尽量不选（除非确有重大信息）：',
-    '- 股东大会通知/会议资料/法律意见书/审计报告/内部控制报告/募集资金存放与使用/担保进展/投资者关系活动记录表/更正公告/补充公告等日常文书',
-    '',
-    '风险项处理：',
-    '- “终止上市/退市/重大风险警示/重大处罚/重大诉讼/立案”等应归入 daily 且靠前（这是重大风险，不是利好）',
-    '- 若没有可选条目，对应数组返回空数组 []',
+    '输出 JSON 格式：',
+    '- 仅包含 2 个字段：daily, perf_q1',
+    '- 每个字段是字符串数组（最多 15 条），每条格式：“股票名：要点”（不要股票代码）',
+    '- 只写事实不推测/不编造，尽量保留数字与单位',
     '',
     `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
     ...picked
@@ -688,6 +725,7 @@ async function getKimiSelectionByKimi() {
       body,
       timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
     });
+    addLlmUsageToAcc(parseLlmUsageFromResponse(j));
     llmDebugLog('MAIL LLM select res: json=ok');
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const parsedJson = parseJsonFromLlm(content);
@@ -735,9 +773,7 @@ async function getAnnouncementDigestByKimi() {
     '要求：',
     `- 只输出${safeTopN}条（不足则全输出），按重要性降序`,
     '- 每条一行，用“- 代码 要点”格式',
-    '- 要点要像财经网站标题一样精炼（尽量<=40个汉字），信息密度高，只写事实不推测/不编造，数字和单位尽量原样保留',
-    '- 不要出现公司名称/简称/股票名称（可用“公司”代替或省略主语）',
-    '- 多篇公告：优先挑选业绩/财报/分红/业绩预告等，其次重大资产/增减持/回购/监管/诉讼/重大合同/股权变动等',
+    '- 要点精炼（尽量<=40个汉字），只写事实不推测/不编造，数字和单位尽量原样保留',
     '',
     `公告列表（共${parsed.count}条，输入给你的是前${picked.length}条）：`,
     ...picked
@@ -766,6 +802,7 @@ async function getAnnouncementDigestByKimi() {
       body,
       timeoutMs: Number(process.env.ANNOUNCE_KIMI_TIMEOUT_MS || 30000)
     });
+    addLlmUsageToAcc(parseLlmUsageFromResponse(j));
     llmDebugLog(`MAIL LLM res: ms=${Date.now() - t0} json=ok`);
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const out = String(content || '');
@@ -885,11 +922,13 @@ async function sendWeComMarkdown(content) {
     console.warn('未设置 EMAIL_MONITOR_WEBHOOK_KEY，跳过企业微信通知');
     return false;
   }
+  const maskedKey = maskSecret(key, { keepStart: 2, keepEnd: 4 });
   const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${encodeURIComponent(key)}`;
   const body = JSON.stringify({
     msgtype: 'markdown',
     markdown: { content: String(content || '') }
   });
+  if (WECOM_DEBUG) console.log(`企业微信WebhookKey(打码): ${maskedKey}`);
   try {
     const j = await requestJson(new URL(url), {
       method: 'POST',
@@ -906,10 +945,12 @@ async function sendWeComMarkdown(content) {
       console.log('✅ 企业微信通知发送成功');
       return true;
     }
-    console.error(`❌ 企业微信发送失败: errcode=${String(j && j.errcode)} errmsg=${String(j && j.errmsg)}`);
+    console.error(`❌ 企业微信发送失败: errcode=${String(j && j.errcode)} errmsg=${String(j && j.errmsg)} key=${maskedKey}`);
     return false;
   } catch (e) {
-    console.error(`企业微信请求失败: ${e && e.message ? e.message : e}`);
+    const sc = e && e.statusCode ? String(e.statusCode) : '';
+    console.error(`企业微信请求失败: status=${sc || 'na'} err=${e && e.message ? e.message : e} key=${maskedKey}`);
+    if (e && e.body) console.error(`企业微信响应摘要: ${cutByChars(e.body, 260)}`);
     return false;
   }
 }
@@ -926,6 +967,8 @@ function buildWeComNotice({ kimiSelectionText, kimiDigestMarkdown }) {
   const parts = [];
   const sel = String(kimiSelectionText || '').trim();
   if (sel) parts.push(sel);
+  const digest = String(kimiDigestMarkdown || '').trim();
+  if (digest) parts.push(digest);
   return trimWeComMarkdown(parts.filter(Boolean).join('\n\n'));
 }
 
@@ -964,7 +1007,7 @@ function runCrawler() {
     process.stderr.write(s);
   });
 
-  child.on('close', (code) => {
+  child.on('close', async (code) => {
     clearTimeout(killTimer);
     const error = killed || code ? new Error(killed ? 'Timeout' : `Exit code: ${code}`) : null;
     if (error && killed) error.killed = true;
@@ -978,7 +1021,7 @@ function runCrawler() {
       console.log(`${logPrefix} stdoutTail >>\n${outTail || '无输出'}\n<<`);
       if (errTail) console.error(`${logPrefix} stderrTail >>\n${errTail}\n<<`);
 
-      // 检查超时
+      // 检查超�?
       if (error && error.killed) {
         console.error(`${logPrefix} 超时中止: 执行超过${EXEC_TIMEOUT/60000}分钟`);
       } 
@@ -989,13 +1032,31 @@ function runCrawler() {
 
       // 关键诊断信息
       const successDetected = stdout.includes(SUCCESS_FLAG);
-      console.log(`${logPrefix} 成功标志检测: ` + 
-                  (successDetected ? '✔ 找到' : '✖ 未找到'));
+      console.log(`${logPrefix} 成功标志检测: ` + (successDetected ? '✔ 找到' : '✖ 未找到'));
 
-      // 成功时退出
+      // 成功时退�?
       if (successDetected) {
         console.log(`${logPrefix} 爬取成功！`);
         (async () => {
+          const parsedUsageFromRunner = parseLlmUsageFromLogs(`${stdout || ''}\n${stderr || ''}`);
+          const totalUsage = {
+            prompt: LLM_USAGE_ACC.prompt + parsedUsageFromRunner.prompt,
+            completion: LLM_USAGE_ACC.completion + parsedUsageFromRunner.completion,
+            total: LLM_USAGE_ACC.total + parsedUsageFromRunner.total,
+            calls: LLM_USAGE_ACC.calls + parsedUsageFromRunner.calls
+          };
+          const currency = String(process.env.KIMI_CURRENCY || process.env.LLM_CURRENCY || '¥');
+          const bal = await fetchKimiBalance();
+          const usageLine = totalUsage.calls
+            ? [
+                `**Kimi用量**: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
+                bal ? `**Kimi余额**: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `**Kimi余额**: 未获取`
+              ].join('\n\n')
+            : '';
+          const wecomKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
+          const wecomKeyLine = wecomKey
+            ? `**企业微信WebhookKey(打码)**: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
+            : `**企业微信WebhookKey**: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
           const externUserSize = getExternUserFileSizeForNotice();
           const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
           const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
@@ -1005,7 +1066,7 @@ function runCrawler() {
           const annMerge = parseAnnMergeStatsFromStdout(stdout);
           const shouldSkipKimi = annMerge && annMerge.added === 0 && annMerge.updated === 0;
           if (shouldSkipKimi) {
-            console.log(`Kimi精选跳过：公告无新增/更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
+            console.log(`Kimi精选跳过：公告无新�?更新（new=0 updated=0 total=${annMerge.total} unchanged=${annMerge.unchanged}）`);
           }
           const cachedKimi = loadKimiDigestCache();
           const cachedSel = loadKimiSelectionCache();
@@ -1029,17 +1090,19 @@ function runCrawler() {
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
           const mergedSel = mergeKimiSelectionDaily(kimiSel || {});
           const wecomKimi = formatKimiSelectionMessage(mergedSel);
-          const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: '' });
+          const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: usageLine });
           const successMessage = [
-            `### ✅ 爬虫任务成功执行`,
+            `### �?爬虫任务成功执行`,
             `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
-            `**开始时间**: ${startTime.toLocaleString()}`,
+            `**开始时�?*: ${startTime.toLocaleString()}`,
             `**结束时间**: ${endTime.toLocaleString()}`,
             `**执行耗时**: ${elapsed}秒`,
             `**股票总数**: ${totalStockCount}`,
             `**输出行数**: ${lineCount}`,
             `**extern_user.txt 大小**: ${externUserSize}`,
             `**输出摘要**: ${stdout.trim().slice(-100)}`,
+            wecomKeyLine,
+            usageLine,
             llmAlertSummary,
             wecomKimi
           ].filter(Boolean).join('\n\n');
@@ -1047,7 +1110,13 @@ function runCrawler() {
           if (EMAIL_MONITOR_ADDR && EMAIL_MONITOR_AUTH) {
             console.log('EmailMonitor 配置已检测到（当前仅使用企业微信 Webhook 推送）');
           }
-          await sendWeComMarkdown(wecomContent);
+          const wecomOk = await sendWeComMarkdown(wecomContent);
+          if (!wecomOk) {
+            const maskedKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim()
+              ? maskSecret(String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim(), { keepStart: 2, keepEnd: 4 })
+              : '';
+            console.warn(`企业微信未发送成功${maskedKey ? `（WebhookKey打码: ${maskedKey}）` : ''}，请检查 secrets/群机器人配置与任务日志`);
+          }
           sendServerChan(successMessage).finally(() => process.exit(0));
         })().catch((e) => {
           console.error('Build notice failed:', e && e.message ? e.message : e);
@@ -1076,12 +1145,33 @@ function runCrawler() {
         const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
         const lineCountMatch = stdout.match(/Line count:\s*(\d+)/);
         const lineCount = lineCountMatch ? lineCountMatch[1] : '未知';
+        const parsedUsageFromRunner = parseLlmUsageFromLogs(`${stdout || ''}\n${stderr || ''}`);
+        const totalUsage = {
+          prompt: LLM_USAGE_ACC.prompt + parsedUsageFromRunner.prompt,
+          completion: LLM_USAGE_ACC.completion + parsedUsageFromRunner.completion,
+          total: LLM_USAGE_ACC.total + parsedUsageFromRunner.total,
+          calls: LLM_USAGE_ACC.calls + parsedUsageFromRunner.calls
+        };
+        const currency = String(process.env.KIMI_CURRENCY || process.env.LLM_CURRENCY || '¥');
+        const bal = await fetchKimiBalance();
+        const usageLine = totalUsage.calls
+          ? [
+              `**Kimi用量**: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
+              bal ? `**Kimi余额**: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `**Kimi余额**: 未获取`
+            ].join('\n\n')
+          : '';
+        const wecomKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
+        const wecomKeyLine = wecomKey
+          ? `**企业微信WebhookKey(打码)**: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
+          : `**企业微信WebhookKey**: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
         const errorMessage = [
           `## ❌ 爬虫任务失败`,
           `已达最大重试次数 (${MAX_RETRIES})`,
           `**股票总数**: ${totalStockCount}`,
           `**输出行数**: ${lineCount}`,
-          `**extern_user.txt 大小**: ${externUserSize}`
+          `**extern_user.txt 大小**: ${externUserSize}`,
+          wecomKeyLine,
+          usageLine
         ].join('\n\n');
         console.log(`\n===== Server酱通知内容（预览）=====\n${errorMessage}\n===== 结束 =====\n`);
         sendServerChan(errorMessage).finally(() => {
