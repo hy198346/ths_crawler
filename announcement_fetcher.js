@@ -109,6 +109,17 @@ function cninfoDateString(offsetDays = 0) {
     return dtf.format(d);
 }
 
+function prevTradingDay(dateStr) {
+    for (let off = -1; off >= -10; off--) {
+        const d = new Date(new Date(dateStr + 'T00:00:00+08:00').getTime() + off * 86400000);
+        const wd = new Intl.DateTimeFormat('en', { timeZone: CNINFO_TZ, weekday: 'short' }).format(d);
+        if (wd !== 'Sat' && wd !== 'Sun') {
+            return new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+        }
+    }
+    return dateStr;
+}
+
 function cleanOneLine(s) {
     return String(s || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -511,7 +522,7 @@ async function cninfoQuery({ seDate, pageNum, pageSize, column, plate, category 
     return j;
 }
 
-async function cninfoDailyByStock(dateStr) {
+async function cninfoDailyByStock(dateStr, endHourMinute) {
     const out = new Map();
     const seenAnn = new Set();
     const maxPages = Number.isFinite(CNINFO_MAX_PAGES) && CNINFO_MAX_PAGES > 0 ? CNINFO_MAX_PAGES : 1;
@@ -520,6 +531,8 @@ async function cninfoDailyByStock(dateStr) {
     const queries = Array.isArray(CNINFO_QUERIES) && CNINFO_QUERIES.length ? CNINFO_QUERIES : [{ plate: 'sz', column: 'szse' }];
     const targetDayStart = dateStr ? new Date(dateStr + 'T00:00:00+08:00').getTime() : 0;
     const targetDayEnd = targetDayStart > 0 ? targetDayStart + 86400000 - 1 : 0;
+    const ehm = endHourMinute;
+    const endCutoffMs = ehm ? new Date(dateStr + `T${String(ehm).slice(0, 2)}:${String(ehm).slice(2, 4)}:00+08:00`).getTime() : 0;
 
     for (const q of queries) {
         const plate = q && q.plate !== undefined ? String(q.plate) : '';
@@ -562,7 +575,8 @@ async function cninfoDailyByStock(dateStr) {
                 if (!secCode) continue;
                 const announcementId = String(item.announcementId || item.announcement_id || '').trim();
                 const epochMs = cninfoEpochMs(item.announcementTime || item.announcement_time || '') || 0;
-                if (targetDayStart > 0 && (epochMs < targetDayStart || epochMs > targetDayEnd)) continue;
+                const effectiveEnd = endCutoffMs || targetDayEnd;
+                if (targetDayStart > 0 && (epochMs < targetDayStart || epochMs > effectiveEnd)) continue;
                 const title = String(item.announcementTitle || item.announcement_title || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
                 const adjunctUrl = String(item.adjunctUrl || item.adjunct_url || '').trim();
                 const timeStr = formatCninfoTime(item.announcementTime || item.announcement_time || '');
@@ -672,20 +686,36 @@ function cninfoMergeStockEntry(cur, next) {
 async function cninfoPickDays(lookbackDays) {
     const d = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
     const merged = new Map();
+    const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(nowBJ);
+    const prevStr = prevTradingDay(todayStr);
+    const prevPrevStr = prevTradingDay(prevStr);
+    const hhmm = Number(nowBJ.toISOString().slice(11, 16).replace(':', ''));
+    const isTodayTradingDay = todayStr === prevStr || hhmm >= 930;
+
     if (d === 1) {
-        const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
-        const hhmm = Number(nowBJ.toISOString().slice(11, 16).replace(':', ''));
-        let daysToFetch;
-        if (hhmm < 915) {
-            daysToFetch = [-1, 0];
-        } else if (hhmm >= 1500) {
-            daysToFetch = [0, 1];
+        if (!isTodayTradingDay) {
+            const prevDayMap = await cninfoDailyByStock(prevStr);
+            for (const [k, v] of prevDayMap.entries()) {
+                const cur = merged.get(k);
+                if (!cur) merged.set(k, v);
+                else merged.set(k, cninfoMergeStockEntry(cur, v));
+            }
+        } else if (hhmm < 930) {
+            const prevPrevDayMap = await cninfoDailyByStock(prevPrevStr);
+            const todayDayMap = await cninfoDailyByStock(todayStr, 929);
+            for (const [k, v] of prevPrevDayMap.entries()) {
+                const cur = merged.get(k);
+                if (!cur) merged.set(k, v);
+                else merged.set(k, cninfoMergeStockEntry(cur, v));
+            }
+            for (const [k, v] of todayDayMap.entries()) {
+                const cur = merged.get(k);
+                if (!cur) merged.set(k, v);
+                else merged.set(k, cninfoMergeStockEntry(cur, v));
+            }
         } else {
-            daysToFetch = [0];
-        }
-        for (const off of daysToFetch) {
-            const day = cninfoDateString(off);
-            const dayMap = await cninfoDailyByStock(day);
+            const dayMap = await cninfoDailyByStock(todayStr);
             for (const [k, v] of dayMap.entries()) {
                 const cur = merged.get(k);
                 if (!cur) merged.set(k, v);
