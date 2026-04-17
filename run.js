@@ -398,13 +398,50 @@ function saveKimiSelectionCache(obj) {
 
 function normalizeKimiSelection(obj) {
   const safeArr = (v) => (Array.isArray(v) ? v.map((x) => cleanOneLine(x)).filter(Boolean) : []);
+  const dateRaw = obj && typeof obj === 'object' && obj.date ? cleanOneLine(obj.date) : '';
   const out = {
+    date: /^\d{4}-\d{2}-\d{2}$/.test(dateRaw) ? dateRaw : '',
     ann_good: safeArr(obj && obj.ann_good),
     perf_good: safeArr(obj && obj.perf_good),
     ann_bad: safeArr(obj && obj.ann_bad),
     perf_bad: safeArr(obj && obj.perf_bad)
   };
   return out;
+}
+
+function mergeKimiSelectionDaily(selection) {
+  const today = getShanghaiDayString();
+  const cur = normalizeKimiSelection(selection);
+  const prevRaw = loadKimiSelectionCache();
+  const prev = normalizeKimiSelection(prevRaw);
+  const shouldMergePrev = prev && (prev.date === today || !prev.date);
+  const mergeArr = (a, b) => {
+    const out = [];
+    const seen = new Set();
+    for (const it of a) {
+      const t = cleanOneLine(it);
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+    }
+    for (const it of b) {
+      const t = cleanOneLine(it);
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+    }
+    return out.slice(0, 15);
+  };
+  const merged = {
+    date: today,
+    ann_good: mergeArr(cur.ann_good, shouldMergePrev ? prev.ann_good : []),
+    perf_good: mergeArr(cur.perf_good, shouldMergePrev ? prev.perf_good : []),
+    ann_bad: mergeArr(cur.ann_bad, shouldMergePrev ? prev.ann_bad : []),
+    perf_bad: mergeArr(cur.perf_bad, shouldMergePrev ? prev.perf_bad : [])
+  };
+  saveKimiSelectionCache(merged);
+  saveKimiDigestCache(formatKimiSelectionMessage(merged));
+  return merged;
 }
 
 function formatKimiSelectionMessage(obj) {
@@ -415,8 +452,10 @@ function formatKimiSelectionMessage(obj) {
     if (!items.length) return `${title}\n\n无`;
     return `${title}\n\n${items.join('\n')}`;
   };
+  const dateLine = s.date ? `日期：${s.date}` : '';
   return [
-    'Kimi精选',
+    '公告要闻（Kimi精选）',
+    dateLine,
     '',
     section('一、公告利好', s.ann_good),
     '',
@@ -500,9 +539,8 @@ async function getKimiSelectionByKimi() {
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const parsedJson = parseJsonFromLlm(content);
     if (!parsedJson) return null;
-    const normalized = normalizeKimiSelection(parsedJson);
-    saveKimiSelectionCache(normalized);
-    return normalized;
+    const merged = mergeKimiSelectionDaily(parsedJson);
+    return merged;
   } catch (e) {
     const sc = e && e.statusCode ? String(e.statusCode) : '';
     console.warn(`MAIL LLM select failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
@@ -733,13 +771,8 @@ function trimWeComMarkdown(content) {
 function buildWeComNotice({ kimiSelectionText, kimiDigestMarkdown }) {
   const parts = [];
   const sel = String(kimiSelectionText || '').trim();
-  const dig = String(kimiDigestMarkdown || '').trim();
-  if (sel) {
-    parts.push('### Kimi精选（分类）');
-    parts.push(sel);
-  }
-  if (dig) parts.push(dig);
-  return trimWeComMarkdown(parts.filter(Boolean).join('\n\n---\n\n'));
+  if (sel) parts.push(sel);
+  return trimWeComMarkdown(parts.filter(Boolean).join('\n\n'));
 }
 
 function runCrawler() {
@@ -840,8 +873,9 @@ function runCrawler() {
           }
           const nameMap = loadStockNameMap();
           const annSummary = injectStockNamesIntoKimiSection(kimiDigest || getAnnouncementSummaryForNotice(), nameMap);
-          const wecomKimi = formatKimiSelectionMessage(kimiSel);
-          const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: annSummary });
+          const mergedSel = mergeKimiSelectionDaily(kimiSel || {});
+          const wecomKimi = formatKimiSelectionMessage(mergedSel);
+          const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: '' });
           const successMessage = [
             `### ✅ 爬虫任务成功执行`,
             `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
@@ -853,7 +887,7 @@ function runCrawler() {
             `**extern_user.txt 大小**: ${externUserSize}`,
             `**输出摘要**: ${stdout.trim().slice(-100)}`,
             llmAlertSummary,
-            annSummary
+            wecomKimi
           ].filter(Boolean).join('\n\n');
           console.log(`\n===== Server酱通知内容（预览）=====\n${successMessage}\n===== 结束 =====\n`);
           if (EMAIL_MONITOR_ADDR && EMAIL_MONITOR_AUTH) {
