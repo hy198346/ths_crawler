@@ -15,7 +15,10 @@ on:
     branches:
       - main
   schedule:
-    - cron: '7 11,23 * * *'  # UTC时间（对应北京时间7:07,19:07等）
+    # 周日-周四 19:00（北京时间）= 11:00（UTC）
+    - cron: '0 11 * * 0-4'
+    # 周一-周五 07:00（北京时间）= 23:00（UTC，前一天）=> UTC 周日-周四
+    - cron: '0 23 * * 0-4'
   workflow_dispatch:
 
 permissions:
@@ -24,11 +27,10 @@ permissions:
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
     
     steps:
-      - name: 设置时区（调试用）
-        run: sudo timedatectl set-timezone UTC
-      
       - name: 输出当前时间（调试）
         run: date
         
