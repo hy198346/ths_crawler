@@ -109,13 +109,53 @@ function cninfoDateString(offsetDays = 0) {
     return dtf.format(d);
 }
 
-function prevTradingDay(dateStr) {
-    for (let off = -1; off >= -10; off--) {
-        const d = new Date(new Date(dateStr + 'T00:00:00+08:00').getTime() + off * 86400000);
-        const wd = new Intl.DateTimeFormat('en', { timeZone: CNINFO_TZ, weekday: 'short' }).format(d);
-        if (wd !== 'Sat' && wd !== 'Sun') {
-            return new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+const _tradingDayCache = { days: null, fetchedAt: 0 };
+function cninfoFetchTradingDays() {
+    return new Promise((resolve) => {
+        const now = Date.now();
+        if (_tradingDayCache.days && now - _tradingDayCache.fetchedAt < 3600000) {
+            resolve(_tradingDayCache.days); return;
         }
+        const https = require('https');
+        const today = cninfoDateString(0);
+        const past = cninfoDateString(-30);
+        const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayhfq&param=sh000001,day,${past},${today},40,hfq&qid=chart`;
+        https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.qq.com/' } }, (res) => {
+            let d = ''; res.on('data', c => d += c); res.on('end', () => {
+                try {
+                    const json = JSON.parse(String(d).replace(/^[^=]+=/, ''));
+                    const days = (json.data.sh000001.day || []).map((arr) => String(arr[0]));
+                    _tradingDayCache.days = new Set(days);
+                    _tradingDayCache.fetchedAt = now;
+                    resolve(_tradingDayCache.days);
+                } catch { resolve(new Set()); }
+            });
+        }).on('error', () => resolve(new Set()));
+    });
+}
+
+function cninfoIsTradingDay(dateStr, tradingDays) {
+    if (!tradingDays || tradingDays.size === 0) {
+        const wd = new Intl.DateTimeFormat('en', { timeZone: CNINFO_TZ, weekday: 'short' }).format(new Date(dateStr + 'T00:00:00+08:00'));
+        return wd !== 'Sat' && wd !== 'Sun';
+    }
+    return tradingDays.has(dateStr);
+}
+
+function cninfoPrevTradingDay(dateStr, tradingDays) {
+    for (let off = -1; off >= -20; off--) {
+        const d = new Date(new Date(dateStr + 'T00:00:00+08:00').getTime() + off * 86400000);
+        const dayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+        if (cninfoIsTradingDay(dayStr, tradingDays)) return dayStr;
+    }
+    return dateStr;
+}
+
+function cninfoNextTradingDay(dateStr, tradingDays) {
+    for (let off = 1; off <= 20; off++) {
+        const d = new Date(new Date(dateStr + 'T00:00:00+08:00').getTime() + off * 86400000);
+        const dayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+        if (cninfoIsTradingDay(dayStr, tradingDays)) return dayStr;
     }
     return dateStr;
 }
@@ -492,7 +532,7 @@ async function cninfoQuery({ seDate, pageNum, pageSize, column, plate, category 
         secid: '',
         category: String(category || ''),
         trade: '',
-        seDate: String(seDate || ''),
+        seDate: '',
         sortName: 'time',
         sortType: 'desc',
         isHLtitle: 'true'
@@ -686,12 +726,14 @@ function cninfoMergeStockEntry(cur, next) {
 async function cninfoPickDays(lookbackDays) {
     const d = Number.isFinite(lookbackDays) && lookbackDays > 0 ? Math.floor(lookbackDays) : 1;
     const merged = new Map();
+    const tradingDays = await cninfoFetchTradingDays();
     const nowBJ = new Date(Date.now() + 8 * 3600 * 1000);
     const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: CNINFO_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(nowBJ);
-    const prevStr = prevTradingDay(todayStr);
-    const prevPrevStr = prevTradingDay(prevStr);
+    const prevStr = cninfoPrevTradingDay(todayStr, tradingDays);
+    const prevPrevStr = cninfoPrevTradingDay(prevStr, tradingDays);
+    const nextStr = cninfoNextTradingDay(todayStr, tradingDays);
     const hhmm = Number(nowBJ.toISOString().slice(11, 16).replace(':', ''));
-    const isTodayTradingDay = todayStr === prevStr || hhmm >= 930;
+    const isTodayTradingDay = cninfoIsTradingDay(todayStr, tradingDays);
 
     if (d === 1) {
         if (!isTodayTradingDay) {
@@ -725,14 +767,21 @@ async function cninfoPickDays(lookbackDays) {
         return merged;
     }
     const days = Math.min(Math.max(d, 1), 14);
-    for (let off = 0; off >= -(days - 1); off -= 1) {
+    let off = 0;
+    let fetched = 0;
+    while (fetched < days) {
         const day = cninfoDateString(off);
-        const dayMap = await cninfoDailyByStock(day);
-        for (const [k, v] of dayMap.entries()) {
-            const cur = merged.get(k);
-            if (!cur) merged.set(k, v);
-            else merged.set(k, cninfoMergeStockEntry(cur, v));
+        if (cninfoIsTradingDay(day, tradingDays)) {
+            const dayMap = await cninfoDailyByStock(day);
+            for (const [k, v] of dayMap.entries()) {
+                const cur = merged.get(k);
+                if (!cur) merged.set(k, v);
+                else merged.set(k, cninfoMergeStockEntry(cur, v));
+            }
+            fetched++;
         }
+        off--;
+        if (off < -90) break;
     }
     return merged;
 }
