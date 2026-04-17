@@ -56,11 +56,11 @@ jobs:
           ANN_LOOKBACK_DAYS: '1'
           ANN_RUN_TIMES: '3'
           CNINFO_PLATES: 'all'
-          CNINFO_MAX_PAGES: '300'
+          CNINFO_MAX_PAGES: '300'va
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          ANNOUNCEMENT_SUMMARY_CHARS: ${{ secrets.ANNOUNCEMENT_SUMMARY_CHARS }}
-          KIMI_DEBUG: ${{ secrets.KIMI_DEBUG }}
-          ANNOUNCE_KIMI_TOP_N: ${{ secrets.ANNOUNCE_KIMI_TOP_N }}
+          ANNOUNCEMENT_SUMMARY_CHARS: ${{ vars.ANNOUNCEMENT_SUMMARY_CHARS }}
+          KIMI_DEBUG: ${{ vars.KIMI_DEBUG }}
+          ANNOUNCE_KIMI_TOP_N: ${{ vars.ANNOUNCE_KIMI_TOP_N }}
           EMAIL_MONITOR_WEBHOOK_KEY: ${{ secrets.EMAIL_MONITOR_WEBHOOK_KEY }}
           
         run: |
