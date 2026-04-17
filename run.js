@@ -1049,14 +1049,14 @@ function runCrawler() {
           const bal = await fetchKimiBalance();
           const usageLine = totalUsage.calls
             ? [
-                `**Kimi用量**: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
-                bal ? `**Kimi余额**: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `**Kimi余额**: 未获取`
+                `『Kimi用量』: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
+                bal ? `『Kimi余额』: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `『Kimi余额』: 未获取`
               ].join('\n\n')
             : '';
           const wecomKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
           const wecomKeyLine = wecomKey
-            ? `**企业微信WebhookKey(打码)**: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
-            : `**企业微信WebhookKey**: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
+            ? `『企业微信WebhookKey(打码)』: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
+            : `『企业微信WebhookKey』: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
           const externUserSize = getExternUserFileSizeForNotice();
           const totalStockMatch = stdout.match(/Total stock count:\s*(\d+)/);
           const totalStockCount = totalStockMatch ? totalStockMatch[1] : '未知';
@@ -1092,15 +1092,15 @@ function runCrawler() {
           const wecomKimi = formatKimiSelectionMessage(mergedSel);
           const wecomContent = buildWeComNotice({ kimiSelectionText: wecomKimi, kimiDigestMarkdown: usageLine });
           const successMessage = [
-            `### �?爬虫任务成功执行`,
-            `**尝试次数**: ${attempt}/${MAX_RETRIES}`,
-            `**开始时�?*: ${startTime.toLocaleString()}`,
-            `**结束时间**: ${endTime.toLocaleString()}`,
-            `**执行耗时**: ${elapsed}秒`,
-            `**股票总数**: ${totalStockCount}`,
-            `**输出行数**: ${lineCount}`,
-            `**extern_user.txt 大小**: ${externUserSize}`,
-            `**输出摘要**: ${stdout.trim().slice(-100)}`,
+              `### ✅ 爬虫任务成功执行`,
+              `『尝试次数』: ${attempt}/${MAX_RETRIES}`,
+              `『开始时间』: ${startTime.toLocaleString()}`,
+              `『结束时间』: ${endTime.toLocaleString()}`,
+              `『执行耗时』: ${elapsed}秒`,
+              `『股票总数』: ${totalStockCount}`,
+              `『输出行数』: ${lineCount}`,
+              `『extern_user.txt 大小』: ${externUserSize}`,
+              `『输出摘要』: ${stdout.trim().slice(-100)}`,
             wecomKeyLine,
             usageLine,
             llmAlertSummary,
@@ -1156,20 +1156,20 @@ function runCrawler() {
         const bal = await fetchKimiBalance();
         const usageLine = totalUsage.calls
           ? [
-              `**Kimi用量**: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
-              bal ? `**Kimi余额**: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `**Kimi余额**: 未获取`
+              `『Kimi用量』: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
+              bal ? `『Kimi余额』: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `『Kimi余额』: 未获取`
             ].join('\n\n')
           : '';
         const wecomKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
         const wecomKeyLine = wecomKey
-          ? `**企业微信WebhookKey(打码)**: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
-          : `**企业微信WebhookKey**: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
+          ? `『企业微信WebhookKey(打码)』: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
+          : `『企业微信WebhookKey』: 未配置（EMAIL_MONITOR_WEBHOOK_KEY 为空会直接跳过推送）`;
         const errorMessage = [
           `## ❌ 爬虫任务失败`,
           `已达最大重试次数 (${MAX_RETRIES})`,
-          `**股票总数**: ${totalStockCount}`,
-          `**输出行数**: ${lineCount}`,
-          `**extern_user.txt 大小**: ${externUserSize}`,
+          `『股票总数』: ${totalStockCount}`,
+          `『输出行数』: ${lineCount}`,
+          `『extern_user.txt 大小』: ${externUserSize}`,
           wecomKeyLine,
           usageLine
         ].join('\n\n');
