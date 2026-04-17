@@ -409,6 +409,64 @@ function normalizeKimiSelection(obj) {
   return out;
 }
 
+function isKimiSelectionEmpty(sel) {
+  const s = normalizeKimiSelection(sel);
+  return (
+    (!s.ann_good || s.ann_good.length === 0) &&
+    (!s.perf_good || s.perf_good.length === 0) &&
+    (!s.ann_bad || s.ann_bad.length === 0) &&
+    (!s.perf_bad || s.perf_bad.length === 0)
+  );
+}
+
+function fallbackKimiSelectionFromAnnouncements(parsed, nameMap) {
+  const today = getShanghaiDayString();
+  const items = parsed && Array.isArray(parsed.items) ? parsed.items : [];
+  const out = { date: today, ann_good: [], perf_good: [], ann_bad: [], perf_bad: [] };
+  const seen = new Set();
+  const push = (k, v) => {
+    if (!v) return;
+    if (out[k].length >= 15) return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    out[k].push(v);
+  };
+  const parseLine = (t) => {
+    const s = cleanOneLine(t);
+    const m = /^(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}\s+(.+?)\s+(.*)$/.exec(s);
+    if (!m) return { name: '', point: s };
+    return { name: cleanOneLine(m[2]), point: cleanOneLine(m[3]) };
+  };
+  const hasAny = (s, arr) => arr.some((k) => s.includes(k));
+  const perfMarks = ['营收', '净利', '净利润', '同比', 'EPS', '每股收益', '季度报告', '年报', '年度报告', '业绩', '利润', '亏损', '预增', '预减', '快报'];
+  const perfBadMarks = ['亏', '亏损', '下降', '下滑', '减少', '预减', '由盈转亏', '修正为亏', '同比降', '同比下降', '同比减少'];
+  const perfGoodMarks = ['增长', '同比增', '预增', '扭亏', '大增'];
+  const annGoodMarks = ['中标', '签订', '合同', '投资', '回购', '增持', '扩产', '项目', '获批', '通过', '合作', '并购', '收购', '订单'];
+  const annBadMarks = ['减持', '诉讼', '处罚', '立案', '终止', '风险', '冻结', '退市', '被动', '下调', '警示'];
+
+  for (const it of items) {
+    const stockId = it && it.stockId ? String(it.stockId).trim() : '';
+    const rawText = it && it.text ? String(it.text) : '';
+    const { name, point } = parseLine(rawText);
+    const stockName = name || (nameMap && stockId && nameMap.get(stockId) ? String(nameMap.get(stockId)) : '');
+    const one = `${cleanOneLine(stockName || stockId)}：${point}`;
+    const p = cleanOneLine(point);
+    const isPerf = hasAny(p, perfMarks);
+    if (isPerf) {
+      const isBad = hasAny(p, perfBadMarks) && !hasAny(p, perfGoodMarks);
+      const isGood = hasAny(p, perfGoodMarks) && !hasAny(p, perfBadMarks);
+      if (isBad) push('perf_bad', one);
+      else push('perf_good', one);
+      continue;
+    }
+    const isAnnBad = hasAny(p, annBadMarks);
+    const isAnnGood = hasAny(p, annGoodMarks);
+    if (isAnnBad && !isAnnGood) push('ann_bad', one);
+    else push('ann_good', one);
+  }
+  return out;
+}
+
 function mergeKimiSelectionDaily(selection) {
   const today = getShanghaiDayString();
   const cur = normalizeKimiSelection(selection);
@@ -439,6 +497,12 @@ function mergeKimiSelectionDaily(selection) {
     ann_bad: mergeArr(cur.ann_bad, shouldMergePrev ? prev.ann_bad : []),
     perf_bad: mergeArr(cur.perf_bad, shouldMergePrev ? prev.perf_bad : [])
   };
+  if (isKimiSelectionEmpty(cur) && shouldMergePrev && !isKimiSelectionEmpty(prev)) {
+    const keep = { ...prev, date: today };
+    saveKimiSelectionCache(keep);
+    saveKimiDigestCache(formatKimiSelectionMessage(keep));
+    return keep;
+  }
   saveKimiSelectionCache(merged);
   saveKimiDigestCache(formatKimiSelectionMessage(merged));
   return merged;
@@ -468,7 +532,6 @@ function formatKimiSelectionMessage(obj) {
 }
 
 async function getKimiSelectionByKimi() {
-  if (!LLM_API_KEY) return null;
   let parsed;
   try {
     parsed = parseAnnouncementFileForLlm();
@@ -476,6 +539,11 @@ async function getKimiSelectionByKimi() {
     return null;
   }
   if (!parsed || !parsed.count) return null;
+
+  const nameMap = loadStockNameMap();
+  if (!LLM_API_KEY) {
+    return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
+  }
 
   const maxInLines = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_LINES || 800);
   const maxInChars = Number(process.env.ANNOUNCE_KIMI_INPUT_MAX_CHARS || 120000);
@@ -538,14 +606,15 @@ async function getKimiSelectionByKimi() {
     llmDebugLog('MAIL LLM select res: json=ok');
     const content = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
     const parsedJson = parseJsonFromLlm(content);
-    if (!parsedJson) return null;
-    const merged = mergeKimiSelectionDaily(parsedJson);
-    return merged;
+    if (!parsedJson) {
+      return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
+    }
+    return mergeKimiSelectionDaily(parsedJson);
   } catch (e) {
     const sc = e && e.statusCode ? String(e.statusCode) : '';
     console.warn(`MAIL LLM select failed: status=${sc || 'na'} err=${e && e.message ? e.message : e}`);
     if (e && e.body) console.warn(`MAIL LLM select body: ${cutByChars(e.body, 300)}`);
-    return null;
+    return mergeKimiSelectionDaily(fallbackKimiSelectionFromAnnouncements(parsed, nameMap));
   }
 }
 
