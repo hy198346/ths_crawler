@@ -275,8 +275,9 @@ function getAnnouncementSummaryForNotice() {
       const parts = lines[i].split('|');
       if (parts.length < 5) continue;
       const stockId = parts[1];
+      const annTime = parts[2] || '';
       const text = parts[3];
-      const one = `- ${stockId} ${text}`;
+      const one = `- ${stockId}${annTime ? ` [${annTime}]` : ''} ${text}`;
       used += one.length;
       if (used > maxChars) break;
       out.push(one);

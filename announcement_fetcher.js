@@ -745,7 +745,7 @@ async function cninfoPickDays(lookbackDays) {
             }
         } else if (hhmm < 930) {
             const prevPrevDayMap = await cninfoDailyByStock(prevPrevStr);
-            const todayDayMap = await cninfoDailyByStock(todayStr, 929);
+            const todayDayMap = await cninfoDailyByStock(todayStr, 930);
             for (const [k, v] of prevPrevDayMap.entries()) {
                 const cur = merged.get(k);
                 if (!cur) merged.set(k, v);
