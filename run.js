@@ -1045,14 +1045,28 @@ function runCrawler() {
             total: LLM_USAGE_ACC.total + parsedUsageFromRunner.total,
             calls: LLM_USAGE_ACC.calls + parsedUsageFromRunner.calls
           };
+          console.log(`[DEBUG] LLM usage: runner=${JSON.stringify(parsedUsageFromRunner)} acc=${JSON.stringify({p:LLM_USAGE_ACC.prompt,c:LLM_USAGE_ACC.completion,t:LLM_USAGE_ACC.total,cc:LLM_USAGE_ACC.calls})} total=${JSON.stringify(totalUsage)}`);
           const currency = String(process.env.KIMI_CURRENCY || process.env.LLM_CURRENCY || '¥');
           const bal = await fetchKimiBalance();
-          const usageLine = totalUsage.calls
-            ? [
-                `『Kimi用量』: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`,
-                bal ? `『Kimi余额』: ${bal.available == null ? '未知' : formatMoney(bal.available, currency)}${bal.voucher == null ? '' : `（券:${formatMoney(bal.voucher, currency)}）`}` : `『Kimi余额』: 未获取`
-              ].join('\n\n')
-            : '';
+          const hasUsage = totalUsage.calls > 0;
+          const hasBal = bal && (bal.available != null || bal.voucher != null);
+          const usageParts = [];
+          if (hasUsage) {
+            usageParts.push(`『Kimi用量』: prompt=${totalUsage.prompt} completion=${totalUsage.completion} total=${totalUsage.total} calls=${totalUsage.calls}`);
+          }
+          if (hasBal) {
+            const availStr = bal.available != null ? formatMoney(bal.available, currency) : '未知';
+            const voucherStr = bal.voucher != null ? formatMoney(bal.voucher, currency) : '未知';
+            usageParts.push(`『Kimi余额』: ${availStr}${bal.voucher != null ? `（券:${voucherStr}）` : ''}`);
+          } else if (LLM_API_KEY) {
+            usageParts.push(`『Kimi余额』: 未获取（KIMI_API_KEY已配置）`);
+          } else {
+            usageParts.push(`『Kimi余额』: 未配置KIMI_API_KEY`);
+          }
+          if (!hasUsage && hasBal) {
+            usageParts.push(`『Kimi用量』: 0（子进程LLM_USAGE日志未捕获，请检查runner.js输出）`);
+          }
+          const usageLine = usageParts.join('\n\n');
           const wecomKey = String(EMAIL_MONITOR_WEBHOOK_KEY || '').trim();
           const wecomKeyLine = wecomKey
             ? `『企业微信WebhookKey(打码)』: ${maskSecret(wecomKey, { keepStart: 2, keepEnd: 4 })}`
